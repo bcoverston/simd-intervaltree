@@ -1,0 +1,46 @@
+[package]
+name = "simd-intervaltree"
+version = "0.1.0"
+edition = "2021"
+authors = ["Benjamin Coverston <ben.coverston@gmail.com>"]
+license = "MIT"
+description = "A SIMD-accelerated interval tree with zero-allocation queries"
+repository = "https://github.com/bcoverston/simd-intervaltree"
+keywords = ["interval", "tree", "simd", "range", "overlap"]
+categories = ["data-structures", "algorithms"]
+readme = "README.md"
+
+[features]
+default = ["std", "jemalloc"]
+std = []
+jemalloc = ["tikv-jemallocator"]
+
+[dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+intervaltree = "0.2"  # For comparison benchmarks
+proptest = "1.4"
+
+[[bench]]
+name = "query"
+harness = false
+
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.bench]
+lto = true
+codegen-units = 1
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "deny"
+pedantic = "warn"
+nursery = "warn"
