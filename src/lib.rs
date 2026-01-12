@@ -105,6 +105,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn count_overlaps_matches_iter() {
+        let tree = IntervalTree::builder()
+            .insert(0i64..10, "a")
+            .insert(5..15, "b")
+            .insert(10..20, "c")
+            .insert(20..30, "d")
+            .insert(25..35, "e")
+            .build();
+
+        // Test various query ranges
+        let queries = [(3, 12), (0, 5), (15, 25), (0, 100), (50, 60)];
+        for (start, end) in queries {
+            let iter_count = tree.query(start..end).count();
+            let simd_count = tree.count_overlaps(start..end);
+            assert_eq!(
+                iter_count, simd_count,
+                "mismatch for query {}..{}: iter={}, simd={}",
+                start, end, iter_count, simd_count
+            );
+        }
+    }
+
+    #[test]
     fn interval_overlap() {
         let a = Interval::new(0, 10);
         let b = Interval::new(5, 15);

@@ -41,6 +41,30 @@ pub fn find_ge_threshold_i64(arr: &[i64], threshold: i64) -> usize {
     scalar::find_ge_threshold(arr, threshold)
 }
 
+/// Counts elements where `arr[i] > threshold` (unsorted array).
+///
+/// Uses SIMD to count in parallel.
+#[inline]
+pub fn count_gt_threshold_i64(arr: &[i64], threshold: i64) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { x86::count_gt_threshold_avx512(arr, threshold) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { x86::count_gt_threshold_avx2(arr, threshold) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { arm::count_gt_threshold_neon(arr, threshold) };
+    }
+
+    #[allow(unreachable_code)]
+    scalar::count_gt_threshold(arr, threshold)
+}
+
 /// Finds the first index where `arr[i] <= threshold` in a sorted (descending) array.
 ///
 /// Returns `arr.len()` if no such element exists.

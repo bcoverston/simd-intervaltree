@@ -1,6 +1,6 @@
 //! Query iterators for zero-allocation traversal.
 
-use crate::tree::{IntervalTree, Node};
+use crate::tree::IntervalTree;
 use crate::Interval;
 
 /// An entry returned by query iteration.
@@ -19,16 +19,14 @@ pub struct QueryEntry<'a, T, V> {
 pub struct QueryIter<'a, T, V> {
     tree: &'a IntervalTree<T, V>,
     query: Interval<T>,
-    /// Stack of (node_index, phase) for traversal.
-    /// Phase: 0 = process node, 1 = process right child
-    stack: [(usize, u8); 64], // Max depth of 64 should be plenty
+    /// Stack of node indices for traversal.
+    stack: [usize; 64], // Max depth of 64 should be plenty
     stack_len: usize,
     /// Current position within a node's interval list.
-    current_node: usize,
     current_pos: usize,
     current_end: usize,
-    /// Which list we're iterating: 0 = by_start (data array), 1 = by_end (indirect)
-    current_list: u8,
+    /// Which case we're in: 0 = all intervals, 1 = by-end desc, 2 = check start
+    current_case: u8,
 }
 
 impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
@@ -36,16 +34,15 @@ impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
         let mut iter = Self {
             tree,
             query,
-            stack: [(0, 0); 64],
+            stack: [0; 64],
             stack_len: 0,
-            current_node: Node::NULL,
             current_pos: 0,
             current_end: 0,
-            current_list: 0,
+            current_case: 0,
         };
 
         if !tree.nodes.is_empty() {
-            iter.stack[0] = (0, 0);
+            iter.stack[0] = 0;
             iter.stack_len = 1;
         }
 
@@ -54,43 +51,50 @@ impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
 
     fn advance_to_next(&mut self) -> Option<QueryEntry<'a, T, V>> {
         loop {
-            // First, try to yield from current node's interval list
+            // Try to yield from current node's interval list
             while self.current_pos < self.current_end {
                 let pos = self.current_pos;
                 self.current_pos += 1;
 
-                // Get the actual index
-                let idx = if self.current_list == 0 {
-                    // Direct access - data is contiguous per node
-                    pos
-                } else {
-                    // Indirect access through by_end_indices
-                    self.tree.by_end_indices[pos]
-                };
-
-                let start = self.tree.starts[idx];
-                let end = self.tree.ends[idx];
-
-                // Check early termination based on which list we're in
-                if self.current_list == 0 {
-                    // Sorted by start ascending
-                    if start >= self.query.end {
-                        self.current_pos = self.current_end; // Skip rest
-                        break;
+                match self.current_case {
+                    0 => {
+                        // Case 1: All intervals overlap (iterate by start)
+                        let start = self.tree.starts[pos];
+                        let end = self.tree.ends[pos];
+                        return Some(QueryEntry {
+                            interval: Interval { start, end },
+                            value: &self.tree.values[pos],
+                        });
                     }
-                } else {
-                    // Sorted by end descending
-                    if end <= self.query.start {
-                        self.current_pos = self.current_end; // Skip rest
-                        break;
+                    1 => {
+                        // Case 2: By-end descending - early terminate when end <= query.start
+                        let end = self.tree.ends_desc[pos];
+                        if end <= self.query.start {
+                            self.current_pos = self.current_end; // Skip rest
+                            break;
+                        }
+                        let i = self.tree.by_end_indices[pos];
+                        let start = self.tree.starts[i];
+                        return Some(QueryEntry {
+                            interval: Interval { start, end },
+                            value: &self.tree.values[i],
+                        });
                     }
+                    2 => {
+                        // Case 3: By start - early terminate when start >= query.end
+                        let start = self.tree.starts[pos];
+                        if start >= self.query.end {
+                            self.current_pos = self.current_end; // Skip rest
+                            break;
+                        }
+                        let end = self.tree.ends[pos];
+                        return Some(QueryEntry {
+                            interval: Interval { start, end },
+                            value: &self.tree.values[pos],
+                        });
+                    }
+                    _ => unreachable!(),
                 }
-
-                // This interval overlaps
-                return Some(QueryEntry {
-                    interval: Interval { start, end },
-                    value: &self.tree.values[idx],
-                });
             }
 
             // Pop from stack
@@ -99,59 +103,56 @@ impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
             }
 
             self.stack_len -= 1;
-            let (node_idx, phase) = self.stack[self.stack_len];
+            let node_idx = self.stack[self.stack_len];
 
             if node_idx >= self.tree.nodes.len() {
                 continue;
             }
 
             let node = &self.tree.nodes[node_idx];
-            let pivot = self.tree.starts[node.pivot_idx];
 
-            match phase {
-                0 => {
-                    // Determine which case we're in
-                    if self.query.start <= pivot && pivot < self.query.end {
-                        // Case 1: Query contains pivot - yield all, search both
-                        self.current_node = node_idx;
-                        self.current_pos = node.data_begin;
-                        self.current_end = node.data_end;
-                        self.current_list = 0;
+            // Early pruning with max_end
+            if node.max_end <= self.query.start {
+                continue;
+            }
 
-                        // Push children for later
-                        if node.has_right() {
-                            self.stack[self.stack_len] = (node.right, 0);
-                            self.stack_len += 1;
-                        }
-                        if node.has_left() {
-                            self.stack[self.stack_len] = (node.left, 0);
-                            self.stack_len += 1;
-                        }
-                    } else if pivot < self.query.start {
-                        // Case 2: Pivot left of query - scan by end, go right
-                        self.current_node = node_idx;
-                        self.current_pos = node.by_end_begin;
-                        self.current_end = node.by_end_end;
-                        self.current_list = 1;
+            let pivot = node.pivot;
 
-                        if node.has_right() {
-                            self.stack[self.stack_len] = (node.right, 0);
-                            self.stack_len += 1;
-                        }
-                    } else {
-                        // Case 3: Pivot right of query - scan by start, go left
-                        self.current_node = node_idx;
-                        self.current_pos = node.data_begin;
-                        self.current_end = node.data_end;
-                        self.current_list = 0;
+            if self.query.start <= pivot && pivot < self.query.end {
+                // Case 1: Query contains pivot - yield all, search both
+                self.current_pos = node.data_begin;
+                self.current_end = node.data_end;
+                self.current_case = 0;
 
-                        if node.has_left() {
-                            self.stack[self.stack_len] = (node.left, 0);
-                            self.stack_len += 1;
-                        }
-                    }
+                // Push children for later
+                if node.has_right() {
+                    self.stack[self.stack_len] = node.right;
+                    self.stack_len += 1;
                 }
-                _ => continue,
+                if node.has_left() {
+                    self.stack[self.stack_len] = node.left;
+                    self.stack_len += 1;
+                }
+            } else if pivot < self.query.start {
+                // Case 2: Pivot left of query - use by_end_desc for early termination
+                self.current_pos = node.by_end_begin;
+                self.current_end = node.by_end_end;
+                self.current_case = 1;
+
+                if node.has_right() {
+                    self.stack[self.stack_len] = node.right;
+                    self.stack_len += 1;
+                }
+            } else {
+                // Case 3: Pivot right of query - check start, go left
+                self.current_pos = node.data_begin;
+                self.current_end = node.data_end;
+                self.current_case = 2;
+
+                if node.has_left() {
+                    self.stack[self.stack_len] = node.left;
+                    self.stack_len += 1;
+                }
             }
         }
     }

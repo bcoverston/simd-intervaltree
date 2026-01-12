@@ -1,6 +1,5 @@
 //! Builder for constructing interval trees.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::tree::{IntervalTree, Node};
@@ -69,11 +68,14 @@ impl<T, V> IntervalTreeBuilder<T, V> {
 impl<T: Ord + Copy, V> IntervalTreeBuilder<T, V> {
     /// Builds the interval tree.
     ///
-    /// Data is laid out contiguously per node for SIMD-friendly scanning.
-    /// Each node's intervals are sorted by start (ascending) in the main arrays,
-    /// with a separate index array for by-end (descending) ordering.
+    /// Uses O(n log n) construction:
+    /// 1. Sort intervals by start once
+    /// 2. Build tree with in-place partitioning
+    /// 3. Compute max_end bottom-up
+    /// 4. Layout data contiguously per node
+    /// 5. Build by-end sorted arrays for efficient queries
     #[must_use]
-    pub fn build(self) -> IntervalTree<T, V> {
+    pub fn build(mut self) -> IntervalTree<T, V> {
         let n = self.intervals.len();
 
         if n == 0 {
@@ -82,12 +84,16 @@ impl<T: Ord + Copy, V> IntervalTreeBuilder<T, V> {
                 ends: Vec::new(),
                 values: Vec::new(),
                 nodes: Vec::new(),
-                by_end_indices: Vec::new(),
                 ends_desc: Vec::new(),
+                by_end_indices: Vec::new(),
             };
         }
 
-        // Phase 1: Build tree structure and collect intervals per node
+        // Phase 1: Sort by start once - O(n log n)
+        self.intervals
+            .sort_unstable_by(|(a, _), (b, _)| a.start.cmp(&b.start));
+
+        // Extract into SOA format
         let mut input_starts: Vec<T> = Vec::with_capacity(n);
         let mut input_ends: Vec<T> = Vec::with_capacity(n);
         let mut input_values: Vec<V> = Vec::with_capacity(n);
@@ -98,30 +104,36 @@ impl<T: Ord + Copy, V> IntervalTreeBuilder<T, V> {
             input_values.push(value);
         }
 
-        // Build tree and collect intervals per node
-        let indices: Vec<usize> = (0..n).collect();
-        let mut planner = TreePlanner::new(&input_starts, &input_ends);
-        planner.plan_node(&indices);
+        // Phase 2: Build tree structure
+        let mut indices: Vec<usize> = (0..n).collect();
+        let mut node_data: Vec<NodeBuildData<T>> = Vec::new();
+        let mut scratch = PartitionScratch::with_capacity(n);
 
-        // Phase 2: Output data in node order (contiguous per node, sorted by start)
+        build_node_recursive(
+            &input_starts,
+            &input_ends,
+            &mut indices,
+            0,
+            n,
+            &mut node_data,
+            &mut scratch,
+        );
+
+        // Phase 3: Compute max_end bottom-up
+        compute_max_end(&input_ends, &indices, &mut node_data);
+
+        // Phase 4: Layout data contiguously per node
         let mut starts: Vec<T> = Vec::with_capacity(n);
         let mut ends: Vec<T> = Vec::with_capacity(n);
-        let mut values: Vec<V> = Vec::with_capacity(n);
-        let mut by_end_indices: Vec<usize> = Vec::with_capacity(n);
-        let mut ends_desc: Vec<T> = Vec::with_capacity(n);
-        let mut nodes: Vec<Node> = Vec::with_capacity(planner.node_intervals.len());
+        let mut nodes: Vec<Node<T>> = Vec::with_capacity(node_data.len());
 
-        // We need to map old indices to new positions
+        // Map old indices to new positions
         let mut index_map: Vec<usize> = vec![0; n];
 
-        for node_data in &planner.node_intervals {
+        for data in &node_data {
             let node_start_pos = starts.len();
 
-            // Sort by start ascending and output
-            let mut sorted_indices = node_data.containing.clone();
-            sorted_indices.sort_by_key(|&i| input_starts[i]);
-
-            for &old_idx in &sorted_indices {
+            for &old_idx in &indices[data.indices_begin..data.indices_end] {
                 let new_idx = starts.len();
                 index_map[old_idx] = new_idx;
                 starts.push(input_starts[old_idx]);
@@ -130,46 +142,59 @@ impl<T: Ord + Copy, V> IntervalTreeBuilder<T, V> {
 
             let node_end_pos = starts.len();
 
-            // Build by_end indices (sorted by end descending, pointing to new positions)
-            // Also build ends_desc for SIMD scanning
-            let mut by_end = sorted_indices.clone();
-            by_end.sort_by(|&a, &b| input_ends[b].cmp(&input_ends[a]));
-
-            let by_end_begin = by_end_indices.len();
-            for &old_idx in &by_end {
-                by_end_indices.push(index_map[old_idx]);
-                ends_desc.push(input_ends[old_idx]);
-            }
-            let by_end_end = by_end_indices.len();
-
-            // Find pivot in new positions
-            let pivot_new_idx = index_map[node_data.pivot_idx];
-
             nodes.push(Node {
-                pivot_idx: pivot_new_idx,
+                pivot: data.pivot,
+                max_end: data.max_end,
                 data_begin: node_start_pos,
                 data_end: node_end_pos,
-                by_end_begin,
-                by_end_end,
-                left: node_data.left,
-                right: node_data.right,
+                by_end_begin: 0, // Will be filled in phase 5
+                by_end_end: 0,
+                left: data.left,
+                right: data.right,
             });
         }
 
-        // Move values in correct order
-        // We need to iterate in the order we added to starts/ends
-        let mut value_order: Vec<(usize, usize)> = index_map
+        // Reorder values to match new layout
+        let mut values: Vec<V> = Vec::with_capacity(n);
+        let mut value_positions: Vec<(usize, usize)> = index_map
             .iter()
             .enumerate()
             .map(|(old, &new)| (new, old))
             .collect();
-        value_order.sort_by_key(|(new, _)| *new);
+        value_positions.sort_unstable_by_key(|(new, _)| *new);
 
-        // Use a temporary to allow moving values
         let mut temp_values: Vec<Option<V>> = input_values.into_iter().map(Some).collect();
-        for (_, old_idx) in value_order {
-            let val: Option<V> = temp_values[old_idx].take();
-            values.push(val.unwrap());
+        for (_, old_idx) in value_positions {
+            values.push(temp_values[old_idx].take().unwrap());
+        }
+
+        // Phase 5: Build by-end sorted arrays for each node
+        // Pre-allocate all output space, then sort indices in-place per node
+        let mut ends_desc: Vec<T> = Vec::with_capacity(n);
+        let mut by_end_indices: Vec<usize> = Vec::with_capacity(n);
+
+        // Single scratch buffer for sorting indices
+        let mut sort_indices: Vec<usize> = Vec::with_capacity(n);
+
+        for node in &mut nodes {
+            let by_end_begin = ends_desc.len();
+            let node_len = node.data_end - node.data_begin;
+
+            // Collect indices into scratch buffer
+            sort_indices.clear();
+            sort_indices.extend(node.data_begin..node.data_end);
+
+            // Sort indices by their end value (descending)
+            sort_indices.sort_unstable_by(|&a, &b| ends[b].cmp(&ends[a]));
+
+            // Write sorted data to output arrays
+            for &idx in &sort_indices[..node_len] {
+                by_end_indices.push(idx);
+                ends_desc.push(ends[idx]);
+            }
+
+            node.by_end_begin = by_end_begin;
+            node.by_end_end = ends_desc.len();
         }
 
         IntervalTree {
@@ -177,98 +202,141 @@ impl<T: Ord + Copy, V> IntervalTreeBuilder<T, V> {
             ends,
             values,
             nodes,
-            by_end_indices,
             ends_desc,
+            by_end_indices,
         }
     }
 }
 
-/// Intermediate node data during planning phase.
-struct NodeData {
-    pivot_idx: usize,
+/// Scratch space for partitioning
+struct PartitionScratch {
+    left: Vec<usize>,
     containing: Vec<usize>,
+    right: Vec<usize>,
+}
+
+impl PartitionScratch {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            left: Vec::with_capacity(capacity),
+            containing: Vec::with_capacity(capacity),
+            right: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.left.clear();
+        self.containing.clear();
+        self.right.clear();
+    }
+}
+
+/// Intermediate node data during build
+struct NodeBuildData<T> {
+    pivot: T,
+    max_end: T, // Will be computed in phase 3
+    indices_begin: usize,
+    indices_end: usize,
     left: usize,
     right: usize,
 }
 
-/// First pass: plan tree structure without moving data.
-struct TreePlanner<'a, T> {
-    starts: &'a [T],
-    ends: &'a [T],
-    node_intervals: Vec<NodeData>,
+/// Recursively build tree nodes
+fn build_node_recursive<T: Ord + Copy>(
+    starts: &[T],
+    ends: &[T],
+    indices: &mut [usize],
+    lo: usize,
+    hi: usize,
+    nodes: &mut Vec<NodeBuildData<T>>,
+    scratch: &mut PartitionScratch,
+) -> usize {
+    if lo >= hi {
+        return Node::<T>::NULL;
+    }
+
+    let count = hi - lo;
+
+    // Select pivot: median start value (O(1) since sorted)
+    let mid = lo + count / 2;
+    let pivot_idx = indices[mid];
+    let pivot = starts[pivot_idx];
+
+    // Partition: left (end <= pivot), containing (spans pivot), right (start > pivot)
+    scratch.clear();
+
+    for &idx in &indices[lo..hi] {
+        let start = starts[idx];
+        let end = ends[idx];
+
+        if end <= pivot {
+            scratch.left.push(idx);
+        } else if start > pivot {
+            scratch.right.push(idx);
+        } else {
+            scratch.containing.push(idx);
+        }
+    }
+
+    // Write partitioned indices back
+    let left_end = lo + scratch.left.len();
+    let containing_end = left_end + scratch.containing.len();
+
+    indices[lo..left_end].copy_from_slice(&scratch.left);
+    indices[left_end..containing_end].copy_from_slice(&scratch.containing);
+    indices[containing_end..hi].copy_from_slice(&scratch.right);
+
+    // Allocate node (max_end will be filled in later)
+    let node_idx = nodes.len();
+    nodes.push(NodeBuildData {
+        pivot,
+        max_end: pivot, // Placeholder, computed in phase 3
+        indices_begin: left_end,
+        indices_end: containing_end,
+        left: Node::<T>::NULL,
+        right: Node::<T>::NULL,
+    });
+
+    // Recurse on children
+    let left_child = build_node_recursive(starts, ends, indices, lo, left_end, nodes, scratch);
+    let right_child =
+        build_node_recursive(starts, ends, indices, containing_end, hi, nodes, scratch);
+
+    nodes[node_idx].left = left_child;
+    nodes[node_idx].right = right_child;
+
+    node_idx
 }
 
-impl<'a, T: Ord + Copy> TreePlanner<'a, T> {
-    fn new(starts: &'a [T], ends: &'a [T]) -> Self {
-        Self {
-            starts,
-            ends,
-            node_intervals: Vec::new(),
-        }
-    }
+/// Compute max_end for each node bottom-up
+fn compute_max_end<T: Ord + Copy>(
+    ends: &[T],
+    indices: &[usize],
+    nodes: &mut [NodeBuildData<T>],
+) {
+    // Process nodes in reverse order (children before parents due to DFS construction)
+    for i in (0..nodes.len()).rev() {
+        let node = &nodes[i];
 
-    fn plan_node(&mut self, indices: &[usize]) -> usize {
-        if indices.is_empty() {
-            return Node::NULL;
-        }
-
-        // Find median endpoint as pivot
-        let pivot_idx = self.find_median_endpoint(indices);
-        let pivot = self.starts[pivot_idx];
-
-        // Partition intervals
-        let mut containing = Vec::new();
-        let mut left_indices = Vec::new();
-        let mut right_indices = Vec::new();
-
-        for &idx in indices {
-            let start = self.starts[idx];
-            let end = self.ends[idx];
-
-            if end <= pivot {
-                left_indices.push(idx);
-            } else if start > pivot {
-                right_indices.push(idx);
-            } else {
-                containing.push(idx);
+        // Find max end among this node's intervals
+        let mut max_end = ends[indices[node.indices_begin]]; // At least one interval
+        for &idx in &indices[node.indices_begin..node.indices_end] {
+            if ends[idx] > max_end {
+                max_end = ends[idx];
             }
         }
 
-        // Allocate node
-        let node_idx = self.node_intervals.len();
-        self.node_intervals.push(NodeData {
-            pivot_idx,
-            containing,
-            left: Node::NULL,
-            right: Node::NULL,
-        });
+        // Include children's max_end
+        let left = node.left;
+        let right = node.right;
 
-        // Build children
-        let left_child = self.plan_node(&left_indices);
-        let right_child = self.plan_node(&right_indices);
-
-        self.node_intervals[node_idx].left = left_child;
-        self.node_intervals[node_idx].right = right_child;
-
-        node_idx
-    }
-
-    fn find_median_endpoint(&self, indices: &[usize]) -> usize {
-        let mut endpoints: Vec<T> = Vec::with_capacity(indices.len() * 2);
-        for &idx in indices {
-            endpoints.push(self.starts[idx]);
-            endpoints.push(self.ends[idx]);
+        if left != Node::<T>::NULL && nodes[left].max_end > max_end {
+            max_end = nodes[left].max_end;
         }
-        endpoints.sort();
-
-        let median = endpoints[endpoints.len() / 2];
-
-        for &idx in indices {
-            if self.starts[idx] <= median && median < self.ends[idx] {
-                return idx;
-            }
+        if right != Node::<T>::NULL && nodes[right].max_end > max_end {
+            max_end = nodes[right].max_end;
         }
 
-        indices[0]
+        nodes[i].max_end = max_end;
     }
 }

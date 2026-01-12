@@ -22,7 +22,11 @@ tikv-jemallocator = { version = "0.6", optional = true }
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 intervaltree = "0.2"  # For comparison benchmarks
+rust-lapper = "1.1"
+coitrees = "0.4"
+superintervals = "0.3"
 proptest = "1.4"
+divan = "0.1.21"
 
 [[bench]]
 name = "query"
