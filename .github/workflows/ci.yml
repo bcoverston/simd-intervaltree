@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Build + test on every OS/arch this crate claims to support.
+  # ubuntu = x86_64 Linux, windows = x86_64 MSVC (previously broken),
+  # macos = aarch64/NEON (macos-14+ runners are Apple Silicon).
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: cargo build --all-targets
+      - run: cargo test
+
+  # AVX-512 kernels need Rust 1.89+, hence a separate job on current stable.
+  # GitHub runners rarely have AVX-512 hardware, so this proves the code
+  # compiles and that runtime dispatch degrades gracefully; the kernel unit
+  # tests self-skip when the CPU lacks avx512f.
+  avx512:
+    name: test (avx512 feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: cargo test --features avx512
+
+  # Execute the AVX-512 kernels for real under Intel SDE emulation
+  # (Sapphire Rapids profile). GitHub runners rarely expose AVX-512, so this
+  # is the only place the 512-bit instructions actually run. Lib tests only:
+  # they cover the kernel unit tests and the randomized hybrid-scan
+  # cross-check, and emulation is too slow for the proptest suites.
+  avx512-sde:
+    name: avx512 kernels under Intel SDE
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - uses: petarpetrovt/setup-sde@v5.0
+      - run: cargo test --lib --features avx512
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ env.SDE_PATH }}/sde64 -spr --
+
+  # Prove the no_std claim against a target with no std at all.
+  no-std:
+    name: no_std (thumbv7em)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: rustup target add thumbv7em-none-eabihf
+      - run: cargo check --no-default-features --target thumbv7em-none-eabihf
+
+  # Also make sure no_std code paths compile on x86_64 (runtime feature
+  # detection must be absent without std).
+  no-std-x86:
+    name: no_std check (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: cargo check --no-default-features
+
+  msrv:
+    name: MSRV (1.86)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.86 --profile minimal && rustup default 1.86
+      - run: cargo check --all-targets
+
+  lint:
+    name: clippy + fmt
+    runs-on: ubuntu-latest
+    env:
+      # The crate's own lint policy governs here: clippy::all is `deny` via
+      # [lints] in Cargo.toml, while pedantic/nursery stay advisory. A global
+      # -D warnings would promote the advisory groups to hard failures.
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable && rustup component add clippy rustfmt
+      - run: cargo clippy --all-targets
+      - run: cargo fmt --check
+
+  # Miri exercises the safe paths (feature detection reports no SIMD under
+  # Miri, so kernels fall back to scalar) and validates the index arithmetic.
+  # Proptest suites are too slow under Miri; lib tests only.
+  miri:
+    name: miri (lib tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal --component miri && rustup default nightly
+      - run: cargo miri test --lib

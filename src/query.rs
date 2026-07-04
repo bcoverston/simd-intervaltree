@@ -20,7 +20,7 @@ pub struct QueryIter<'a, T, V> {
     tree: &'a IntervalTree<T, V>,
     query: Interval<T>,
     /// Stack of node indices for traversal.
-    stack: [usize; 64], // Max depth of 64 should be plenty
+    stack: [u32; 64], // Max depth of 64 should be plenty
     stack_len: usize,
     /// Current position within a node's interval list.
     current_pos: usize,
@@ -41,7 +41,8 @@ impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
             current_case: 0,
         };
 
-        if !tree.nodes.is_empty() {
+        // An empty query range overlaps nothing; leave the stack empty.
+        if !tree.nodes.is_empty() && query.start < query.end {
             iter.stack[0] = 0;
             iter.stack_len = 1;
         }
@@ -51,8 +52,10 @@ impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
 
     fn advance_to_next(&mut self) -> Option<QueryEntry<'a, T, V>> {
         loop {
-            // Try to yield from current node's interval list
-            while self.current_pos < self.current_end {
+            // Try to yield from the current node's interval list. Every arm
+            // either yields (return) or exhausts the node, so a single `if`
+            // suffices; the enclosing `loop` drives repetition.
+            if self.current_pos < self.current_end {
                 let pos = self.current_pos;
                 self.current_pos += 1;
 
@@ -69,29 +72,27 @@ impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
                     1 => {
                         // Case 2: By-end descending - early terminate when end <= query.start
                         let end = self.tree.ends_desc[pos];
-                        if end <= self.query.start {
-                            self.current_pos = self.current_end; // Skip rest
-                            break;
+                        if end > self.query.start {
+                            let i = self.tree.by_end_indices[pos] as usize;
+                            let start = self.tree.starts[i];
+                            return Some(QueryEntry {
+                                interval: Interval { start, end },
+                                value: &self.tree.values[i],
+                            });
                         }
-                        let i = self.tree.by_end_indices[pos];
-                        let start = self.tree.starts[i];
-                        return Some(QueryEntry {
-                            interval: Interval { start, end },
-                            value: &self.tree.values[i],
-                        });
+                        self.current_pos = self.current_end; // Exhaust node
                     }
                     2 => {
                         // Case 3: By start - early terminate when start >= query.end
                         let start = self.tree.starts[pos];
-                        if start >= self.query.end {
-                            self.current_pos = self.current_end; // Skip rest
-                            break;
+                        if start < self.query.end {
+                            let end = self.tree.ends[pos];
+                            return Some(QueryEntry {
+                                interval: Interval { start, end },
+                                value: &self.tree.values[pos],
+                            });
                         }
-                        let end = self.tree.ends[pos];
-                        return Some(QueryEntry {
-                            interval: Interval { start, end },
-                            value: &self.tree.values[pos],
-                        });
+                        self.current_pos = self.current_end; // Exhaust node
                     }
                     _ => unreachable!(),
                 }
@@ -103,7 +104,7 @@ impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
             }
 
             self.stack_len -= 1;
-            let node_idx = self.stack[self.stack_len];
+            let node_idx = self.stack[self.stack_len] as usize;
 
             if node_idx >= self.tree.nodes.len() {
                 continue;
@@ -120,36 +121,42 @@ impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
 
             if self.query.start <= pivot && pivot < self.query.end {
                 // Case 1: Query contains pivot - yield all, search both
-                self.current_pos = node.data_begin;
-                self.current_end = node.data_end;
+                self.current_pos = node.data_begin as usize;
+                self.current_end = node.data_end as usize;
                 self.current_case = 0;
 
-                // Push children for later
+                // Push children for later. The depth bound holds because
+                // every level's partitions are at most half the parent's
+                // interval count, so depth <= log2(n) + 1 << 64.
                 if node.has_right() {
+                    debug_assert!(self.stack_len < self.stack.len());
                     self.stack[self.stack_len] = node.right;
                     self.stack_len += 1;
                 }
                 if node.has_left() {
+                    debug_assert!(self.stack_len < self.stack.len());
                     self.stack[self.stack_len] = node.left;
                     self.stack_len += 1;
                 }
             } else if pivot < self.query.start {
                 // Case 2: Pivot left of query - use by_end_desc for early termination
-                self.current_pos = node.by_end_begin;
-                self.current_end = node.by_end_end;
+                self.current_pos = node.by_end_begin as usize;
+                self.current_end = node.by_end_end as usize;
                 self.current_case = 1;
 
                 if node.has_right() {
+                    debug_assert!(self.stack_len < self.stack.len());
                     self.stack[self.stack_len] = node.right;
                     self.stack_len += 1;
                 }
             } else {
                 // Case 3: Pivot right of query - check start, go left
-                self.current_pos = node.data_begin;
-                self.current_end = node.data_end;
+                self.current_pos = node.data_begin as usize;
+                self.current_end = node.data_end as usize;
                 self.current_case = 2;
 
                 if node.has_left() {
+                    debug_assert!(self.stack_len < self.stack.len());
                     self.stack[self.stack_len] = node.left;
                     self.stack_len += 1;
                 }
