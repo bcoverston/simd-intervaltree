@@ -4,11 +4,12 @@ A SIMD-accelerated interval tree with zero-allocation queries.
 
 ## Features
 
-- **SIMD acceleration**: AVX-512, AVX2, and NEON for fast sorted-array scans
+- **SIMD acceleration**: AVX2 and NEON kernels with runtime dispatch; AVX-512 opt-in
+- **Hybrid scans**: large sorted runs are binary-narrowed, only the final window is SIMD-scanned
 - **Zero-allocation queries**: Iterator-based API with stack-based traversal
 - **Mutable collections**: `IntervalSet` with stable IDs for insert/remove
 - **`no_std` compatible**: Only requires `alloc`
-- **jemalloc**: Optional (default on) for allocation performance
+- **Zero dependencies**
 
 ## Usage
 
@@ -32,13 +33,16 @@ for entry in tree.query(3..12) {
 // Callback with early termination
 tree.query_with(3..12, |interval, value| {
     println!("{interval:?} => {value}");
-    ControlFlow::Continue(())
+    ControlFlow::<()>::Continue(())
 });
 
 // SIMD-accelerated query for i64 intervals
 tree.query_simd(3..12, |interval, value| {
-    ControlFlow::Continue(())
+    ControlFlow::<()>::Continue(())
 });
+
+// SIMD-accelerated overlap counting (no per-interval yielding)
+let n = tree.count_overlaps(3..12);
 ```
 
 ### Mutable Set with Stable IDs
@@ -70,12 +74,11 @@ if let Some(filename) = sstables.get(id2) {
 
 ## Performance
 
-Benchmarks vs `intervaltree` crate (Apple M-series):
-
-| Size | simd-intervaltree | intervaltree | Speedup |
-|------|-------------------|--------------|---------|
-| 1K   | 164ns            | 216ns        | 24%     |
-| 10K  | 470ns            | 1052ns       | 55%     |
+Run `cargo bench` for numbers on your hardware. The `query` benchmark group
+compares against `intervaltree`, `rust-lapper`, `coitrees`, and
+`superintervals`. Note the two simd-intervaltree entries: the count-only path
+(`count_overlaps`, comparable to coitrees' `query_count`) and the iterator
+path (comparable to crates that must enumerate results).
 
 ## Architecture
 
@@ -84,33 +87,49 @@ Benchmarks vs `intervaltree` crate (Apple M-series):
 Data is laid out contiguously per node for cache efficiency:
 
 - Each node's intervals are stored contiguously, sorted by start
-- SIMD scans find early-termination cutoffs in O(n/lanes) time
-- Separate `ends_desc` array enables SIMD for descending scans
+- A separate `ends_desc` array enables early-terminating descending scans
+- Node metadata uses `u32` indices to keep traversal state compact
+  (a tree holds at most `u32::MAX - 1` intervals)
+
+### Query Scans
+
+Per-node cutoff searches are hybrid:
+
+- Runs of ≤ 64 elements are scanned linearly with SIMD — the common case,
+  and the case SIMD is best at
+- Longer runs are first narrowed by binary search, so large nodes cost
+  O(log n) probes instead of an O(n) sweep
 
 ### SIMD Support
 
-| Architecture | Instruction Set | Elements/Op |
-|--------------|-----------------|-------------|
-| x86_64       | AVX-512         | 8 × i64     |
-| x86_64       | AVX2            | 4 × i64     |
-| aarch64      | NEON            | 2 × i64     |
-| fallback     | scalar          | 1 × i64     |
+| Architecture | Instruction Set | Elements/Op | Availability |
+|--------------|-----------------|-------------|--------------|
+| x86_64       | AVX-512         | 8 × i64     | `avx512` feature (Rust 1.89+) |
+| x86_64       | AVX2            | 4 × i64     | default |
+| aarch64      | NEON            | 2 × i64     | default |
+| fallback     | scalar          | —           | always |
 
-Runtime detection selects the best available.
+On x86_64 the CPU feature level is detected once and cached; per-query
+dispatch is a single relaxed atomic load. Without `std`, detection is
+compile-time only (`-C target-feature=+avx2`).
 
 ## Feature Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `std` | yes | Standard library support |
-| `jemalloc` | yes | Use jemalloc allocator |
+| `std` | yes | Standard library support (enables runtime CPU feature detection) |
+| `avx512` | no | AVX-512 kernels; requires Rust 1.89+ |
 
-Disable defaults for `no_std`:
+Disable defaults for `no_std` (requires only `alloc`):
 
 ```toml
 [dependencies]
-simd-intervaltree = { version = "0.1", default-features = false }
+simd-intervaltree = { version = "0.2", default-features = false }
 ```
+
+## MSRV
+
+Rust 1.86 (1.89+ with the `avx512` feature).
 
 ## License
 

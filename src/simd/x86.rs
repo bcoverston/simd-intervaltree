@@ -1,6 +1,10 @@
-//! x86_64 SIMD implementations using AVX2 and AVX-512.
+//! x86_64 SIMD implementations using AVX2 and (optionally) AVX-512.
+//!
+//! The AVX-512 kernels are gated behind the `avx512` cargo feature because
+//! the underlying intrinsics require Rust 1.89+.
 
-#[cfg(target_arch = "x86_64")]
+#![allow(unsafe_code)]
+
 use core::arch::x86_64::*;
 
 // ============================================================================
@@ -12,7 +16,6 @@ use core::arch::x86_64::*;
 /// # Safety
 ///
 /// Caller must ensure AVX2 is available.
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn find_ge_threshold_avx2(arr: &[i64], threshold: i64) -> usize {
     let len = arr.len();
@@ -27,7 +30,7 @@ pub unsafe fn find_ge_threshold_avx2(arr: &[i64], threshold: i64) -> usize {
 
     // Process 4 elements at a time
     while i + 4 <= len {
-        let values = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+        let values = _mm256_loadu_si256(ptr.add(i).cast());
 
         // Compare: values >= threshold
         // _mm256_cmpgt_epi64 gives us values > threshold
@@ -63,7 +66,6 @@ pub unsafe fn find_ge_threshold_avx2(arr: &[i64], threshold: i64) -> usize {
 /// # Safety
 ///
 /// Caller must ensure AVX2 is available.
-#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn find_le_threshold_avx2(arr: &[i64], threshold: i64) -> usize {
     let len = arr.len();
@@ -78,7 +80,7 @@ pub unsafe fn find_le_threshold_avx2(arr: &[i64], threshold: i64) -> usize {
 
     // Process 4 elements at a time
     while i + 4 <= len {
-        let values = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+        let values = _mm256_loadu_si256(ptr.add(i).cast());
 
         // Compare: values > threshold (we want first where value <= threshold)
         let gt = _mm256_cmpgt_epi64(values, threshold_vec);
@@ -107,7 +109,7 @@ pub unsafe fn find_le_threshold_avx2(arr: &[i64], threshold: i64) -> usize {
 }
 
 // ============================================================================
-// AVX-512 implementations (512-bit, 8 × i64)
+// AVX-512 implementations (512-bit, 8 × i64) — `avx512` feature only
 // ============================================================================
 
 /// Finds the first index where `arr[i] >= threshold` using AVX-512.
@@ -115,7 +117,7 @@ pub unsafe fn find_le_threshold_avx2(arr: &[i64], threshold: i64) -> usize {
 /// # Safety
 ///
 /// Caller must ensure AVX-512F is available.
-#[cfg(target_arch = "x86_64")]
+#[cfg(feature = "avx512")]
 #[target_feature(enable = "avx512f")]
 pub unsafe fn find_ge_threshold_avx512(arr: &[i64], threshold: i64) -> usize {
     let len = arr.len();
@@ -130,7 +132,9 @@ pub unsafe fn find_ge_threshold_avx512(arr: &[i64], threshold: i64) -> usize {
 
     // Process 8 elements at a time
     while i + 8 <= len {
-        let values = _mm512_loadu_si512(ptr.add(i) as *const i64);
+        // `as *const _` lets inference pick the parameter type, which differs
+        // across stdarch versions (*const __m512i since stabilization).
+        let values = _mm512_loadu_si512(ptr.add(i) as *const _);
 
         // Compare: values >= threshold
         // _mm512_cmpge_epi64_mask returns a mask where bit is 1 if value >= threshold
@@ -161,7 +165,7 @@ pub unsafe fn find_ge_threshold_avx512(arr: &[i64], threshold: i64) -> usize {
 /// # Safety
 ///
 /// Caller must ensure AVX-512F is available.
-#[cfg(target_arch = "x86_64")]
+#[cfg(feature = "avx512")]
 #[target_feature(enable = "avx512f")]
 pub unsafe fn find_le_threshold_avx512(arr: &[i64], threshold: i64) -> usize {
     let len = arr.len();
@@ -176,7 +180,7 @@ pub unsafe fn find_le_threshold_avx512(arr: &[i64], threshold: i64) -> usize {
 
     // Process 8 elements at a time
     while i + 8 <= len {
-        let values = _mm512_loadu_si512(ptr.add(i) as *const i64);
+        let values = _mm512_loadu_si512(ptr.add(i) as *const _);
 
         // Compare: values <= threshold
         let mask = _mm512_cmple_epi64_mask(values, threshold_vec);
@@ -201,11 +205,13 @@ pub unsafe fn find_le_threshold_avx512(arr: &[i64], threshold: i64) -> usize {
     len
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(test)]
 mod tests {
+    #[cfg(feature = "std")]
     use super::*;
 
     #[test]
+    #[cfg(feature = "std")]
     fn test_avx2_find_ge() {
         if !is_x86_feature_detected!("avx2") {
             return;
@@ -224,6 +230,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn test_avx2_find_le() {
         if !is_x86_feature_detected!("avx2") {
             return;
@@ -242,6 +249,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "std", feature = "avx512"))]
     fn test_avx512_find_ge() {
         if !is_x86_feature_detected!("avx512f") {
             return;
@@ -260,6 +268,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "std", feature = "avx512"))]
     fn test_avx512_find_le() {
         if !is_x86_feature_detected!("avx512f") {
             return;

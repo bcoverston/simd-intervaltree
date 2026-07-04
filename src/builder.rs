@@ -72,11 +72,20 @@ impl<T: Ord + Copy, V> IntervalTreeBuilder<T, V> {
     /// 1. Sort intervals by start once
     /// 2. Build tree with in-place partitioning
     /// 3. Compute max_end bottom-up
-    /// 4. Layout data contiguously per node
+    /// 4. Layout data contiguously per node (values placed in the same pass)
     /// 5. Build by-end sorted arrays for efficient queries
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than `u32::MAX - 1` intervals were inserted (node
+    /// indices are stored as `u32` to keep the tree compact).
     #[must_use]
     pub fn build(mut self) -> IntervalTree<T, V> {
         let n = self.intervals.len();
+        assert!(
+            n < u32::MAX as usize,
+            "IntervalTree supports at most u32::MAX - 1 intervals"
+        );
 
         if n == 0 {
             return IntervalTree {
@@ -122,25 +131,27 @@ impl<T: Ord + Copy, V> IntervalTreeBuilder<T, V> {
         // Phase 3: Compute max_end bottom-up
         compute_max_end(&input_ends, &indices, &mut node_data);
 
-        // Phase 4: Layout data contiguously per node
+        // Phase 4: Layout data contiguously per node.
+        // Values are placed in the same pass, in the same order as
+        // starts/ends, so no separate permutation (or its extra sort) is
+        // needed.
         let mut starts: Vec<T> = Vec::with_capacity(n);
         let mut ends: Vec<T> = Vec::with_capacity(n);
+        let mut values: Vec<V> = Vec::with_capacity(n);
         let mut nodes: Vec<Node<T>> = Vec::with_capacity(node_data.len());
 
-        // Map old indices to new positions
-        let mut index_map: Vec<usize> = vec![0; n];
+        let mut temp_values: Vec<Option<V>> = input_values.into_iter().map(Some).collect();
 
         for data in &node_data {
-            let node_start_pos = starts.len();
+            let node_start_pos = starts.len() as u32;
 
             for &old_idx in &indices[data.indices_begin..data.indices_end] {
-                let new_idx = starts.len();
-                index_map[old_idx] = new_idx;
                 starts.push(input_starts[old_idx]);
                 ends.push(input_ends[old_idx]);
+                values.push(temp_values[old_idx].take().unwrap());
             }
 
-            let node_end_pos = starts.len();
+            let node_end_pos = starts.len() as u32;
 
             nodes.push(Node {
                 pivot: data.pivot,
@@ -154,47 +165,32 @@ impl<T: Ord + Copy, V> IntervalTreeBuilder<T, V> {
             });
         }
 
-        // Reorder values to match new layout
-        let mut values: Vec<V> = Vec::with_capacity(n);
-        let mut value_positions: Vec<(usize, usize)> = index_map
-            .iter()
-            .enumerate()
-            .map(|(old, &new)| (new, old))
-            .collect();
-        value_positions.sort_unstable_by_key(|(new, _)| *new);
-
-        let mut temp_values: Vec<Option<V>> = input_values.into_iter().map(Some).collect();
-        for (_, old_idx) in value_positions {
-            values.push(temp_values[old_idx].take().unwrap());
-        }
-
         // Phase 5: Build by-end sorted arrays for each node
         // Pre-allocate all output space, then sort indices in-place per node
         let mut ends_desc: Vec<T> = Vec::with_capacity(n);
-        let mut by_end_indices: Vec<usize> = Vec::with_capacity(n);
+        let mut by_end_indices: Vec<u32> = Vec::with_capacity(n);
 
         // Single scratch buffer for sorting indices
-        let mut sort_indices: Vec<usize> = Vec::with_capacity(n);
+        let mut sort_indices: Vec<u32> = Vec::with_capacity(n);
 
         for node in &mut nodes {
-            let by_end_begin = ends_desc.len();
-            let node_len = node.data_end - node.data_begin;
+            let by_end_begin = ends_desc.len() as u32;
 
             // Collect indices into scratch buffer
             sort_indices.clear();
             sort_indices.extend(node.data_begin..node.data_end);
 
             // Sort indices by their end value (descending)
-            sort_indices.sort_unstable_by(|&a, &b| ends[b].cmp(&ends[a]));
+            sort_indices.sort_unstable_by(|&a, &b| ends[b as usize].cmp(&ends[a as usize]));
 
             // Write sorted data to output arrays
-            for &idx in &sort_indices[..node_len] {
+            for &idx in &sort_indices[..] {
                 by_end_indices.push(idx);
-                ends_desc.push(ends[idx]);
+                ends_desc.push(ends[idx as usize]);
             }
 
             node.by_end_begin = by_end_begin;
-            node.by_end_end = ends_desc.len();
+            node.by_end_end = ends_desc.len() as u32;
         }
 
         IntervalTree {
@@ -237,8 +233,8 @@ struct NodeBuildData<T> {
     max_end: T, // Will be computed in phase 3
     indices_begin: usize,
     indices_end: usize,
-    left: usize,
-    right: usize,
+    left: u32,
+    right: u32,
 }
 
 /// Recursively build tree nodes
@@ -250,7 +246,7 @@ fn build_node_recursive<T: Ord + Copy>(
     hi: usize,
     nodes: &mut Vec<NodeBuildData<T>>,
     scratch: &mut PartitionScratch,
-) -> usize {
+) -> u32 {
     if lo >= hi {
         return Node::<T>::NULL;
     }
@@ -305,15 +301,11 @@ fn build_node_recursive<T: Ord + Copy>(
     nodes[node_idx].left = left_child;
     nodes[node_idx].right = right_child;
 
-    node_idx
+    node_idx as u32
 }
 
 /// Compute max_end for each node bottom-up
-fn compute_max_end<T: Ord + Copy>(
-    ends: &[T],
-    indices: &[usize],
-    nodes: &mut [NodeBuildData<T>],
-) {
+fn compute_max_end<T: Ord + Copy>(ends: &[T], indices: &[usize], nodes: &mut [NodeBuildData<T>]) {
     // Process nodes in reverse order (children before parents due to DFS construction)
     for i in (0..nodes.len()).rev() {
         let node = &nodes[i];
@@ -330,11 +322,11 @@ fn compute_max_end<T: Ord + Copy>(
         let left = node.left;
         let right = node.right;
 
-        if left != Node::<T>::NULL && nodes[left].max_end > max_end {
-            max_end = nodes[left].max_end;
+        if left != Node::<T>::NULL && nodes[left as usize].max_end > max_end {
+            max_end = nodes[left as usize].max_end;
         }
-        if right != Node::<T>::NULL && nodes[right].max_end > max_end {
-            max_end = nodes[right].max_end;
+        if right != Node::<T>::NULL && nodes[right as usize].max_end > max_end {
+            max_end = nodes[right as usize].max_end;
         }
 
         nodes[i].max_end = max_end;

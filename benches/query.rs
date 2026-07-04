@@ -5,6 +5,12 @@ use rand::{Rng, SeedableRng};
 
 use simd_intervaltree::IntervalTree;
 
+// jemalloc is a property of the benchmark harness, not the library, so every
+// contender allocates through the same allocator. (Not available under MSVC.)
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn generate_intervals(n: usize, seed: u64) -> Vec<(u64, u64)> {
     let mut rng = StdRng::seed_from_u64(seed);
     (0..n)
@@ -34,41 +40,53 @@ fn bench_construction(c: &mut Criterion) {
         let intervals = generate_intervals(size, 42);
 
         // simd-intervaltree (uses i64)
-        group.bench_with_input(BenchmarkId::new("simd-intervaltree", size), &intervals, |b, ivs| {
-            b.iter(|| {
-                let mut builder = IntervalTree::<i64, ()>::builder();
-                for (start, end) in ivs {
-                    builder = builder.insert((*start as i64)..(*end as i64), ());
-                }
-                black_box(builder.build())
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("simd-intervaltree", size),
+            &intervals,
+            |b, ivs| {
+                b.iter(|| {
+                    let mut builder = IntervalTree::<i64, ()>::builder();
+                    for (start, end) in ivs {
+                        builder = builder.insert((*start as i64)..(*end as i64), ());
+                    }
+                    black_box(builder.build())
+                });
+            },
+        );
 
         // intervaltree (uses i64)
-        group.bench_with_input(BenchmarkId::new("intervaltree", size), &intervals, |b, ivs| {
-            b.iter(|| {
-                let tree: intervaltree::IntervalTree<i64, ()> = ivs
-                    .iter()
-                    .map(|(s, e)| ((*s as i64..*e as i64), ()))
-                    .collect();
-                black_box(tree)
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("intervaltree", size),
+            &intervals,
+            |b, ivs| {
+                b.iter(|| {
+                    let tree: intervaltree::IntervalTree<i64, ()> = ivs
+                        .iter()
+                        .map(|(s, e)| ((*s as i64..*e as i64), ()))
+                        .collect();
+                    black_box(tree)
+                });
+            },
+        );
 
         // rust-lapper (requires unsigned)
-        group.bench_with_input(BenchmarkId::new("rust-lapper", size), &intervals, |b, ivs| {
-            b.iter(|| {
-                let data: Vec<rust_lapper::Interval<u64, ()>> = ivs
-                    .iter()
-                    .map(|(s, e)| rust_lapper::Interval {
-                        start: *s,
-                        stop: *e,
-                        val: (),
-                    })
-                    .collect();
-                black_box(rust_lapper::Lapper::new(data))
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("rust-lapper", size),
+            &intervals,
+            |b, ivs| {
+                b.iter(|| {
+                    let data: Vec<rust_lapper::Interval<u64, ()>> = ivs
+                        .iter()
+                        .map(|(s, e)| rust_lapper::Interval {
+                            start: *s,
+                            stop: *e,
+                            val: (),
+                        })
+                        .collect();
+                    black_box(rust_lapper::Lapper::new(data))
+                });
+            },
+        );
 
         // coitrees (uses i32, end-inclusive)
         group.bench_with_input(BenchmarkId::new("coitrees", size), &intervals, |b, ivs| {
@@ -82,16 +100,20 @@ fn bench_construction(c: &mut Criterion) {
         });
 
         // superintervals (uses i32)
-        group.bench_with_input(BenchmarkId::new("superintervals", size), &intervals, |b, ivs| {
-            b.iter(|| {
-                let mut imap = superintervals::IntervalMap::new();
-                for (s, e) in ivs {
-                    imap.add(*s as i32, *e as i32, ());
-                }
-                imap.build();
-                black_box(imap)
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("superintervals", size),
+            &intervals,
+            |b, ivs| {
+                b.iter(|| {
+                    let mut imap = superintervals::IntervalMap::new();
+                    for (s, e) in ivs {
+                        imap.add(*s as i32, *e as i32, ());
+                    }
+                    imap.build();
+                    black_box(imap)
+                });
+            },
+        );
     }
 
     group.finish();
@@ -147,15 +169,35 @@ fn bench_query(c: &mut Criterion) {
             imap
         };
 
-        // simd-intervaltree (SIMD count)
-        group.bench_with_input(BenchmarkId::new("simd-intervaltree", size), &queries, |b, qs| {
-            let mut i = 0;
-            b.iter(|| {
-                let (start, end) = qs[i % qs.len()];
-                i += 1;
-                black_box(simd_tree.count_overlaps((start as i64)..(end as i64)))
-            });
-        });
+        // simd-intervaltree (SIMD count path; compare against coitrees'
+        // query_count, which is the same kind of count-only operation)
+        group.bench_with_input(
+            BenchmarkId::new("simd-intervaltree", size),
+            &queries,
+            |b, qs| {
+                let mut i = 0;
+                b.iter(|| {
+                    let (start, end) = qs[i % qs.len()];
+                    i += 1;
+                    black_box(simd_tree.count_overlaps((start as i64)..(end as i64)))
+                });
+            },
+        );
+
+        // simd-intervaltree (iterator enumeration; the honest comparison
+        // for intervaltree/rust-lapper, which have no count-only fast path)
+        group.bench_with_input(
+            BenchmarkId::new("simd-intervaltree-iter", size),
+            &queries,
+            |b, qs| {
+                let mut i = 0;
+                b.iter(|| {
+                    let (start, end) = qs[i % qs.len()];
+                    i += 1;
+                    black_box(simd_tree.query((start as i64)..(end as i64)).count())
+                });
+            },
+        );
 
         // intervaltree
         group.bench_with_input(BenchmarkId::new("intervaltree", size), &queries, |b, qs| {
@@ -163,7 +205,11 @@ fn bench_query(c: &mut Criterion) {
             b.iter(|| {
                 let (start, end) = qs[i % qs.len()];
                 i += 1;
-                black_box(intervaltree_tree.query((start as i64)..(end as i64)).count())
+                black_box(
+                    intervaltree_tree
+                        .query((start as i64)..(end as i64))
+                        .count(),
+                )
             });
         });
 
@@ -188,17 +234,21 @@ fn bench_query(c: &mut Criterion) {
         });
 
         // superintervals
-        group.bench_with_input(BenchmarkId::new("superintervals", size), &queries, |b, qs| {
-            let mut i = 0;
-            let mut results = Vec::new();
-            b.iter(|| {
-                let (start, end) = qs[i % qs.len()];
-                i += 1;
-                results.clear();
-                superintervals_map.search_values(start as i32, end as i32, &mut results);
-                black_box(results.len())
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("superintervals", size),
+            &queries,
+            |b, qs| {
+                let mut i = 0;
+                let mut results = Vec::new();
+                b.iter(|| {
+                    let (start, end) = qs[i % qs.len()];
+                    i += 1;
+                    results.clear();
+                    superintervals_map.search_values(start as i32, end as i32, &mut results);
+                    black_box(results.len())
+                });
+            },
+        );
     }
 
     group.finish();
@@ -246,7 +296,11 @@ fn bench_query_collect(c: &mut Criterion) {
                 b.iter(|| {
                     let (start, end) = qs[i % qs.len()];
                     i += 1;
-                    black_box(simd_tree.query((start as i64)..(end as i64)).collect::<Vec<_>>())
+                    black_box(
+                        simd_tree
+                            .query((start as i64)..(end as i64))
+                            .collect::<Vec<_>>(),
+                    )
                 });
             },
         );
@@ -279,5 +333,10 @@ fn bench_query_collect(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_construction, bench_query, bench_query_collect);
+criterion_group!(
+    benches,
+    bench_construction,
+    bench_query,
+    bench_query_collect
+);
 criterion_main!(benches);

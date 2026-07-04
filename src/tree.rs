@@ -32,10 +32,14 @@ pub struct IntervalTree<T, V> {
     /// End values sorted descending (contiguous per node, for SIMD scanning).
     pub(crate) ends_desc: Vec<T>,
     /// Indices into starts/ends/values for by-end ordering.
-    pub(crate) by_end_indices: Vec<usize>,
+    pub(crate) by_end_indices: Vec<u32>,
 }
 
 /// A node in the interval tree.
+///
+/// Indices are `u32` rather than `usize`: a tree holds at most `u32::MAX - 1`
+/// intervals (enforced by the builder), and the narrower fields keep nodes
+/// small so more of the traversal metadata stays in cache.
 #[derive(Debug, Clone)]
 pub(crate) struct Node<T> {
     /// The pivot value used for partitioning.
@@ -43,21 +47,21 @@ pub(crate) struct Node<T> {
     /// Maximum end value in this subtree (for pruning).
     pub max_end: T,
     /// Start index of this node's intervals in data arrays.
-    pub data_begin: usize,
+    pub data_begin: u32,
     /// End index (exclusive) of this node's intervals.
-    pub data_end: usize,
+    pub data_end: u32,
     /// Start index in by_end arrays.
-    pub by_end_begin: usize,
+    pub by_end_begin: u32,
     /// End index (exclusive) in by_end arrays.
-    pub by_end_end: usize,
-    /// Index of left child node, or `usize::MAX` if none.
-    pub left: usize,
-    /// Index of right child node, or `usize::MAX` if none.
-    pub right: usize,
+    pub by_end_end: u32,
+    /// Index of left child node, or `u32::MAX` if none.
+    pub left: u32,
+    /// Index of right child node, or `u32::MAX` if none.
+    pub right: u32,
 }
 
 impl<T> Node<T> {
-    pub const NULL: usize = usize::MAX;
+    pub const NULL: u32 = u32::MAX;
 
     #[inline]
     pub fn has_left(&self) -> bool {
@@ -123,18 +127,18 @@ impl<T: Ord + Copy, V> IntervalTree<T, V> {
 
     fn query_node<F, B>(
         &self,
-        node_idx: usize,
+        node_idx: u32,
         query: &Interval<T>,
         callback: &mut F,
     ) -> ControlFlow<B>
     where
         F: FnMut(&Interval<T>, &V) -> ControlFlow<B>,
     {
-        if node_idx >= self.nodes.len() {
+        if node_idx as usize >= self.nodes.len() {
             return ControlFlow::Continue(());
         }
 
-        let node = &self.nodes[node_idx];
+        let node = &self.nodes[node_idx as usize];
 
         // Early pruning: if max_end <= query.start, no overlaps possible in this subtree
         if node.max_end <= query.start {
@@ -145,7 +149,7 @@ impl<T: Ord + Copy, V> IntervalTree<T, V> {
 
         // Case 1: Query contains pivot - all intervals at node overlap
         if query.start <= pivot && pivot < query.end {
-            for i in node.data_begin..node.data_end {
+            for i in node.data_begin as usize..node.data_end as usize {
                 let interval = Interval {
                     start: self.starts[i],
                     end: self.ends[i],
@@ -164,12 +168,12 @@ impl<T: Ord + Copy, V> IntervalTree<T, V> {
         // Case 2: Pivot is left of query - scan by end descending, go right
         else if pivot < query.start {
             // Use ends_desc for early termination
-            for pos in node.by_end_begin..node.by_end_end {
+            for pos in node.by_end_begin as usize..node.by_end_end as usize {
                 let end = self.ends_desc[pos];
                 if end <= query.start {
                     break;
                 }
-                let i = self.by_end_indices[pos];
+                let i = self.by_end_indices[pos] as usize;
                 let interval = Interval {
                     start: self.starts[i],
                     end,
@@ -183,7 +187,7 @@ impl<T: Ord + Copy, V> IntervalTree<T, V> {
         }
         // Case 3: Pivot is right of query - scan by start (ascending), go left
         else {
-            for i in node.data_begin..node.data_end {
+            for i in node.data_begin as usize..node.data_end as usize {
                 let start = self.starts[i];
                 if start >= query.end {
                     break;
@@ -216,12 +220,12 @@ impl<V> IntervalTree<i64, V> {
         self.count_node_simd(0, &query)
     }
 
-    fn count_node_simd(&self, node_idx: usize, query: &Interval<i64>) -> usize {
-        if node_idx >= self.nodes.len() {
+    fn count_node_simd(&self, node_idx: u32, query: &Interval<i64>) -> usize {
+        if node_idx as usize >= self.nodes.len() {
             return 0;
         }
 
-        let node = &self.nodes[node_idx];
+        let node = &self.nodes[node_idx as usize];
 
         // Early pruning with max_end
         if node.max_end <= query.start {
@@ -232,7 +236,7 @@ impl<V> IntervalTree<i64, V> {
 
         if query.start <= pivot && pivot < query.end {
             // Case 1: Query contains pivot - all intervals at node overlap
-            let count = node.data_end - node.data_begin;
+            let count = (node.data_end - node.data_begin) as usize;
             let left_count = if node.has_left() {
                 self.count_node_simd(node.left, query)
             } else {
@@ -246,7 +250,7 @@ impl<V> IntervalTree<i64, V> {
             count + left_count + right_count
         } else if pivot < query.start {
             // Case 2: Pivot left of query - use SIMD on ends_desc
-            let node_ends = &self.ends_desc[node.by_end_begin..node.by_end_end];
+            let node_ends = &self.ends_desc[node.by_end_begin as usize..node.by_end_end as usize];
             let cutoff = crate::simd::find_le_threshold_i64(node_ends, query.start);
             let count = cutoff;
 
@@ -258,7 +262,7 @@ impl<V> IntervalTree<i64, V> {
             count + right_count
         } else {
             // Case 3: Pivot right of query - use SIMD on starts
-            let node_starts = &self.starts[node.data_begin..node.data_end];
+            let node_starts = &self.starts[node.data_begin as usize..node.data_end as usize];
             let cutoff = crate::simd::find_ge_threshold_i64(node_starts, query.end);
             let count = cutoff;
 
@@ -283,18 +287,18 @@ impl<V> IntervalTree<i64, V> {
 
     fn query_node_simd<F, B>(
         &self,
-        node_idx: usize,
+        node_idx: u32,
         query: &Interval<i64>,
         callback: &mut F,
     ) -> ControlFlow<B>
     where
         F: FnMut(&Interval<i64>, &V) -> ControlFlow<B>,
     {
-        if node_idx >= self.nodes.len() {
+        if node_idx as usize >= self.nodes.len() {
             return ControlFlow::Continue(());
         }
 
-        let node = &self.nodes[node_idx];
+        let node = &self.nodes[node_idx as usize];
 
         // Early pruning with max_end
         if node.max_end <= query.start {
@@ -305,7 +309,7 @@ impl<V> IntervalTree<i64, V> {
 
         if query.start <= pivot && pivot < query.end {
             // Case 1: Query contains pivot - yield all
-            for i in node.data_begin..node.data_end {
+            for i in node.data_begin as usize..node.data_end as usize {
                 let interval = Interval {
                     start: self.starts[i],
                     end: self.ends[i],
@@ -321,11 +325,12 @@ impl<V> IntervalTree<i64, V> {
             }
         } else if pivot < query.start {
             // Case 2: Use SIMD to find cutoff in ends_desc
-            let node_ends = &self.ends_desc[node.by_end_begin..node.by_end_end];
+            let by_end_begin = node.by_end_begin as usize;
+            let node_ends = &self.ends_desc[by_end_begin..node.by_end_end as usize];
             let cutoff = crate::simd::find_le_threshold_i64(node_ends, query.start);
 
-            for pos in node.by_end_begin..(node.by_end_begin + cutoff) {
-                let i = self.by_end_indices[pos];
+            for pos in by_end_begin..(by_end_begin + cutoff) {
+                let i = self.by_end_indices[pos] as usize;
                 let interval = Interval {
                     start: self.starts[i],
                     end: self.ends[i],
@@ -338,10 +343,11 @@ impl<V> IntervalTree<i64, V> {
             }
         } else {
             // Case 3: Use SIMD to find cutoff by start
-            let node_starts = &self.starts[node.data_begin..node.data_end];
+            let data_begin = node.data_begin as usize;
+            let node_starts = &self.starts[data_begin..node.data_end as usize];
             let cutoff = crate::simd::find_ge_threshold_i64(node_starts, query.end);
 
-            for i in node.data_begin..(node.data_begin + cutoff) {
+            for i in data_begin..(data_begin + cutoff) {
                 let interval = Interval {
                     start: self.starts[i],
                     end: self.ends[i],
@@ -357,7 +363,3 @@ impl<V> IntervalTree<i64, V> {
         ControlFlow::Continue(())
     }
 }
-
-// Safety: Tree is immutable after construction
-unsafe impl<T: Send, V: Send> Send for IntervalTree<T, V> {}
-unsafe impl<T: Sync, V: Sync> Sync for IntervalTree<T, V> {}

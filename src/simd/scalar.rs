@@ -14,12 +14,6 @@ pub fn find_le_threshold<T: Ord>(arr: &[T], threshold: T) -> usize {
     arr.partition_point(|x| *x > threshold)
 }
 
-/// Counts elements where `arr[i] > threshold` (unsorted array).
-#[inline]
-pub fn count_gt_threshold<T: Ord>(arr: &[T], threshold: T) -> usize {
-    arr.iter().filter(|x| **x > threshold).count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

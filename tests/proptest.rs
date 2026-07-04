@@ -167,6 +167,28 @@ proptest! {
     }
 
     #[test]
+    fn count_overlaps_matches_naive(
+        intervals in intervals_strategy(100),
+        query_start in 0i64..1_000_000,
+        query_len in 1i64..10_000,
+    ) {
+        let query_end = query_start + query_len;
+
+        let tree = {
+            let mut builder = IntervalTree::<i64, usize>::builder();
+            for (i, (start, end)) in intervals.iter().enumerate() {
+                builder = builder.insert(*start..*end, i);
+            }
+            builder.build()
+        };
+
+        let count = tree.count_overlaps(query_start..query_end);
+        let naive = naive_query(&intervals, query_start, query_end).len();
+
+        prop_assert_eq!(count, naive);
+    }
+
+    #[test]
     fn empty_tree_returns_empty(query_start in 0i64..1_000_000, query_len in 1i64..10_000) {
         let tree: IntervalTree<i64, ()> = IntervalTree::builder().build();
         let results: Vec<_> = tree.query(query_start..(query_start + query_len)).collect();
@@ -197,4 +219,54 @@ proptest! {
             prop_assert!(results.is_empty());
         }
     }
+}
+
+/// A single node holding thousands of intervals: all intervals contain the
+/// center point, so they land in one node and queries must scan large sorted
+/// arrays. This exercises the binary-narrow + SIMD-window hybrid path, which
+/// randomized small trees never reach.
+#[test]
+fn large_single_node_scans() {
+    const N: i64 = 5000;
+
+    // Nested intervals [i, 2N - i) for i in 0..N; every one contains N.
+    let mut builder = IntervalTree::<i64, i64>::builder();
+    for i in 0..N {
+        builder = builder.insert(i..(2 * N - i), i);
+    }
+    let tree = builder.build();
+
+    // Case 2 (query right of pivot): [i, 2N - i) overlaps [q, q+100) iff
+    // 2N - i > q, i.e. i < 2N - q.
+    for q in [N + 1, 2 * N - 1000, 2 * N - 64, 2 * N - 1] {
+        let expected = (2 * N - q).min(N) as usize;
+        assert_eq!(
+            tree.count_overlaps(q..(q + 100)),
+            expected,
+            "case 2 count at q={q}"
+        );
+        assert_eq!(
+            tree.query(q..(q + 100)).count(),
+            expected,
+            "case 2 iter at q={q}"
+        );
+    }
+
+    // Case 3 (query left of pivot): overlaps [q-100, q) iff i < q.
+    for q in [1, 63, 64, 65, 1000, N - 1] {
+        let expected = q.min(N) as usize;
+        assert_eq!(
+            tree.count_overlaps((q - 100)..q),
+            expected,
+            "case 3 count at q={q}"
+        );
+        assert_eq!(
+            tree.query((q - 100)..q).count(),
+            expected,
+            "case 3 iter at q={q}"
+        );
+    }
+
+    // Query containing the center matches everything.
+    assert_eq!(tree.count_overlaps((N - 1)..(N + 1)), N as usize);
 }
