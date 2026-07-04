@@ -130,7 +130,7 @@ pub unsafe fn find_ge_threshold_avx512(arr: &[i64], threshold: i64) -> usize {
 
     // Process 8 elements at a time
     while i + 8 <= len {
-        let values = _mm512_loadu_si512(ptr.add(i) as *const i64);
+        let values = _mm512_loadu_si512(ptr.add(i) as *const __m512i);
 
         // Compare: values >= threshold
         // _mm512_cmpge_epi64_mask returns a mask where bit is 1 if value >= threshold
@@ -176,7 +176,7 @@ pub unsafe fn find_le_threshold_avx512(arr: &[i64], threshold: i64) -> usize {
 
     // Process 8 elements at a time
     while i + 8 <= len {
-        let values = _mm512_loadu_si512(ptr.add(i) as *const i64);
+        let values = _mm512_loadu_si512(ptr.add(i) as *const __m512i);
 
         // Compare: values <= threshold
         let mask = _mm512_cmple_epi64_mask(values, threshold_vec);
