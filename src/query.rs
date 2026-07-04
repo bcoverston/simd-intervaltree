@@ -14,7 +14,7 @@ pub struct QueryEntry<'a, T, V> {
 
 /// Iterator over intervals overlapping a query range.
 ///
-/// This iterator does not allocate. It maintains a stack on the stack
+/// This iterator does not allocate. It uses a fixed-size inline array
 /// for tree traversal (bounded by tree depth).
 pub struct QueryIter<'a, T, V> {
     tree: &'a IntervalTree<T, V>,
