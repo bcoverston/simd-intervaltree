@@ -41,7 +41,8 @@ impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
             current_case: 0,
         };
 
-        if !tree.nodes.is_empty() {
+        // An empty query range overlaps nothing; leave the stack empty.
+        if !tree.nodes.is_empty() && query.start < query.end {
             iter.stack[0] = 0;
             iter.stack_len = 1;
         }
@@ -124,12 +125,16 @@ impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
                 self.current_end = node.data_end as usize;
                 self.current_case = 0;
 
-                // Push children for later
+                // Push children for later. The depth bound holds because
+                // every level's partitions are at most half the parent's
+                // interval count, so depth <= log2(n) + 1 << 64.
                 if node.has_right() {
+                    debug_assert!(self.stack_len < self.stack.len());
                     self.stack[self.stack_len] = node.right;
                     self.stack_len += 1;
                 }
                 if node.has_left() {
+                    debug_assert!(self.stack_len < self.stack.len());
                     self.stack[self.stack_len] = node.left;
                     self.stack_len += 1;
                 }
@@ -140,6 +145,7 @@ impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
                 self.current_case = 1;
 
                 if node.has_right() {
+                    debug_assert!(self.stack_len < self.stack.len());
                     self.stack[self.stack_len] = node.right;
                     self.stack_len += 1;
                 }
@@ -150,6 +156,7 @@ impl<'a, T: Ord + Copy, V> QueryIter<'a, T, V> {
                 self.current_case = 2;
 
                 if node.has_left() {
+                    debug_assert!(self.stack_len < self.stack.len());
                     self.stack[self.stack_len] = node.left;
                     self.stack_len += 1;
                 }

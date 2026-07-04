@@ -75,17 +75,28 @@ impl<T: Ord + Copy, V> IntervalTreeBuilder<T, V> {
     /// 4. Layout data contiguously per node (values placed in the same pass)
     /// 5. Build by-end sorted arrays for efficient queries
     ///
+    /// Empty intervals (`start == end`) are dropped: as empty sets they
+    /// overlap nothing, and they cannot participate in pivot partitioning.
+    /// They do not count toward the built tree's `len()`.
+    ///
     /// # Panics
     ///
     /// Panics if more than `u32::MAX - 1` intervals were inserted (node
     /// indices are stored as `u32` to keep the tree compact).
     #[must_use]
     pub fn build(mut self) -> IntervalTree<T, V> {
-        let n = self.intervals.len();
         assert!(
-            n < u32::MAX as usize,
+            self.intervals.len() < u32::MAX as usize,
             "IntervalTree supports at most u32::MAX - 1 intervals"
         );
+
+        // Drop empty intervals: [x, x) overlaps nothing, and an interval
+        // that cannot straddle a pivot would recurse forever in
+        // build_node_recursive.
+        self.intervals
+            .retain(|(interval, _)| interval.start < interval.end);
+
+        let n = self.intervals.len();
 
         if n == 0 {
             return IntervalTree {
@@ -181,7 +192,7 @@ impl<T: Ord + Copy, V> IntervalTreeBuilder<T, V> {
             sort_indices.extend(node.data_begin..node.data_end);
 
             // Sort indices by their end value (descending)
-            sort_indices.sort_unstable_by(|&a, &b| ends[b as usize].cmp(&ends[a as usize]));
+            sort_indices.sort_unstable_by_key(|&i| core::cmp::Reverse(ends[i as usize]));
 
             // Write sorted data to output arrays
             for &idx in &sort_indices[..] {

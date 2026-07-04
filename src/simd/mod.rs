@@ -28,6 +28,9 @@ mod x86;
 #[cfg(target_arch = "aarch64")]
 mod arm;
 
+// On aarch64 the NEON kernels are unconditional, so the scalar fallbacks are
+// only reachable from tests there.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 mod scalar;
 
 /// Window size at or below which we scan linearly (with SIMD where available)

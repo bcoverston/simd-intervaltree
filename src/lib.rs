@@ -75,11 +75,23 @@ impl<T: Ord> Interval<T> {
 
     /// Returns true if this interval overlaps with `other`.
     ///
-    /// Two intervals `[a, b)` and `[c, d)` overlap iff `a < d && c < b`.
+    /// Overlap means the set intersection is non-empty:
+    /// `max(starts) < min(ends)`. Empty intervals (`start == end`) overlap
+    /// nothing — including other empty intervals at the same position.
     #[inline]
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
-        self.start < other.end && other.start < self.end
+        let lo = if self.start > other.start {
+            &self.start
+        } else {
+            &other.start
+        };
+        let hi = if self.end < other.end {
+            &self.end
+        } else {
+            &other.end
+        };
+        lo < hi
     }
 
     /// Returns true if this interval contains the point.
@@ -134,6 +146,13 @@ mod tests {
         assert!(b.overlaps(&a));
         assert!(!a.overlaps(&c)); // [0,10) and [10,20) don't overlap (half-open)
         assert!(!a.overlaps(&d));
+
+        // Empty intervals are empty sets: they overlap nothing, not even
+        // non-empty intervals that span their position.
+        let empty = Interval::new(5, 5);
+        assert!(!empty.overlaps(&a));
+        assert!(!a.overlaps(&empty));
+        assert!(!empty.overlaps(&empty));
     }
 
     #[test]

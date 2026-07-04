@@ -122,6 +122,10 @@ impl<T: Ord + Copy, V> IntervalTree<T, V> {
         F: FnMut(&Interval<T>, &V) -> ControlFlow<B>,
     {
         let query = range.into();
+        // An empty query range overlaps nothing.
+        if query.start >= query.end {
+            return ControlFlow::Continue(());
+        }
         self.query_node(0, &query, &mut callback)
     }
 
@@ -217,6 +221,10 @@ impl<V> IntervalTree<i64, V> {
     #[inline]
     pub fn count_overlaps<R: Into<Interval<i64>>>(&self, range: R) -> usize {
         let query = range.into();
+        // An empty query range overlaps nothing.
+        if query.start >= query.end {
+            return 0;
+        }
         self.count_node_simd(0, &query)
     }
 
@@ -282,6 +290,10 @@ impl<V> IntervalTree<i64, V> {
         F: FnMut(&Interval<i64>, &V) -> ControlFlow<B>,
     {
         let query = range.into();
+        // An empty query range overlaps nothing.
+        if query.start >= query.end {
+            return ControlFlow::Continue(());
+        }
         self.query_node_simd(0, &query, &mut callback)
     }
 

@@ -1,7 +1,7 @@
 //! Property-based tests for interval tree correctness.
 
 use proptest::prelude::*;
-use simd_intervaltree::{Interval, IntervalSet, IntervalTree};
+use simd_intervaltree::{IntervalSet, IntervalTree};
 use std::collections::HashSet;
 
 /// Generate a valid interval (start < end)
@@ -14,13 +14,37 @@ fn intervals_strategy(max_count: usize) -> impl Strategy<Value = Vec<(i64, i64)>
     prop::collection::vec(interval_strategy(), 1..=max_count)
 }
 
-/// Naive brute-force query for comparison
+/// Naive brute-force query for comparison.
+///
+/// Uses mathematical half-open overlap: empty intervals and empty queries
+/// overlap nothing (matching the library's documented semantics).
 fn naive_query(intervals: &[(i64, i64)], query_start: i64, query_end: i64) -> Vec<(i64, i64)> {
+    if query_start >= query_end {
+        return Vec::new();
+    }
     intervals
         .iter()
-        .filter(|(s, e)| *s < query_end && query_start < *e)
+        .filter(|(s, e)| *s < *e && *s < query_end && query_start < *e)
         .copied()
         .collect()
+}
+
+/// Coordinates spanning the full i64 domain, biased toward the extremes,
+/// bounded so `start + 10_000` cannot overflow.
+fn extreme_coord() -> impl Strategy<Value = i64> {
+    prop_oneof![
+        Just(i64::MIN),
+        i64::MIN..i64::MIN + 10_000,
+        -10_000i64..10_000,
+        (i64::MAX - 20_000)..(i64::MAX - 10_000),
+        any::<i64>().prop_map(|v| v.min(i64::MAX - 10_001)),
+    ]
+}
+
+/// Intervals over the full domain, including zero-width ones (len 0).
+fn extreme_intervals(max_count: usize) -> impl Strategy<Value = Vec<(i64, i64)>> {
+    let iv = (extreme_coord(), 0i64..=10_000).prop_map(|(start, len)| (start, start + len));
+    prop::collection::vec(iv, 1..=max_count)
 }
 
 proptest! {
@@ -147,14 +171,14 @@ proptest! {
 
         // Generic query
         let mut generic_results = Vec::new();
-        tree.query_with(query_start..query_end, |interval, _| {
+        let _ = tree.query_with(query_start..query_end, |interval, _| {
             generic_results.push((interval.start, interval.end));
             ControlFlow::<()>::Continue(())
         });
 
         // SIMD query
         let mut simd_results = Vec::new();
-        tree.query_simd(query_start..query_end, |interval, _| {
+        let _ = tree.query_simd(query_start..query_end, |interval, _| {
             simd_results.push((interval.start, interval.end));
             ControlFlow::<()>::Continue(())
         });
@@ -186,6 +210,53 @@ proptest! {
         let naive = naive_query(&intervals, query_start, query_end).len();
 
         prop_assert_eq!(count, naive);
+    }
+
+    /// Full-i64-domain property: negative coordinates, values at the extremes,
+    /// zero-width intervals, and zero-width queries, checked against the
+    /// mathematical overlap definition on every query path.
+    #[test]
+    fn extreme_domain_matches_naive(
+        intervals in extreme_intervals(100),
+        query_start in extreme_coord(),
+        query_len in 0i64..=10_000,
+    ) {
+        let query_end = query_start + query_len;
+
+        let tree = {
+            let mut builder = IntervalTree::<i64, usize>::builder();
+            for (i, (start, end)) in intervals.iter().enumerate() {
+                builder = builder.insert(*start..*end, i);
+            }
+            builder.build()
+        };
+
+        let naive: HashSet<(i64, i64)> = naive_query(&intervals, query_start, query_end)
+            .into_iter()
+            .collect();
+
+        // Iterator path
+        let iter_results: HashSet<(i64, i64)> = tree
+            .query(query_start..query_end)
+            .map(|e| (e.interval.start, e.interval.end))
+            .collect();
+        prop_assert_eq!(&iter_results, &naive);
+
+        // SIMD callback path
+        use std::ops::ControlFlow;
+        let mut simd_results = HashSet::new();
+        let _ = tree.query_simd(query_start..query_end, |interval, _| {
+            simd_results.insert((interval.start, interval.end));
+            ControlFlow::<()>::Continue(())
+        });
+        prop_assert_eq!(&simd_results, &naive);
+
+        // SIMD count path (counts duplicates, so compare against the
+        // unsorted naive Vec length)
+        prop_assert_eq!(
+            tree.count_overlaps(query_start..query_end),
+            naive_query(&intervals, query_start, query_end).len()
+        );
     }
 
     #[test]
@@ -269,4 +340,89 @@ fn large_single_node_scans() {
 
     // Query containing the center matches everything.
     assert_eq!(tree.count_overlaps((N - 1)..(N + 1)), N as usize);
+}
+
+/// Regression: a zero-width interval used to send the builder into infinite
+/// recursion (stack overflow), because [x, x) can never straddle a pivot and
+/// re-entered its own partition forever. Empty intervals are now dropped at
+/// build time.
+#[test]
+fn zero_width_interval_does_not_hang_builder() {
+    let tree = IntervalTree::builder()
+        .insert(5..5, "empty")
+        .insert(0..10, "real")
+        .insert(7..7, "also empty")
+        .build();
+
+    // Empty intervals are dropped and never match.
+    assert_eq!(tree.len(), 1);
+    let hits: Vec<_> = tree.query(0..100).collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(*hits[0].value, "real");
+
+    // The all-empty tree builds and matches nothing.
+    let tree: IntervalTree<i64, ()> = IntervalTree::builder().insert(5..5, ()).build();
+    assert!(tree.is_empty());
+    assert_eq!(tree.query(0..100).count(), 0);
+}
+
+/// Empty query ranges ([x, x)) overlap nothing, on every query path.
+#[test]
+fn empty_query_returns_nothing_on_all_paths() {
+    use std::ops::ControlFlow;
+
+    let tree = IntervalTree::builder()
+        .insert(0i64..10, "a")
+        .insert(3..7, "b")
+        .build();
+
+    // Query point 5 is strictly inside both intervals; the raw formula
+    // `s < qe && qs < e` would claim overlap, but an empty set overlaps
+    // nothing.
+    assert_eq!(tree.query(5..5).count(), 0);
+    assert_eq!(tree.count_overlaps(5..5), 0);
+
+    let mut with_hits = 0;
+    let _ = tree.query_with(5..5, |_, _| {
+        with_hits += 1;
+        ControlFlow::<()>::Continue(())
+    });
+    assert_eq!(with_hits, 0);
+
+    let mut simd_hits = 0;
+    let _ = tree.query_simd(5..5, |_, _| {
+        simd_hits += 1;
+        ControlFlow::<()>::Continue(())
+    });
+    assert_eq!(simd_hits, 0);
+}
+
+/// IntervalSet with zero-width intervals: IDs stay valid, queries skip them.
+#[test]
+fn interval_set_zero_width() {
+    let mut set = IntervalSet::new();
+    let empty_id = set.insert(5..5, "empty");
+    let real_id = set.insert(0..10, "real");
+
+    assert_eq!(set.len(), 2); // both stored
+    assert_eq!(set.get(empty_id), Some(&"empty")); // ID lookup still works
+
+    let hits: Vec<_> = set.query(0..100).map(|(id, _, _)| id).collect();
+    assert_eq!(hits, vec![real_id]); // but queries never return it
+}
+
+/// Boundary coordinates at the edges of i64.
+#[test]
+fn extreme_coordinate_boundaries() {
+    let tree = IntervalTree::builder()
+        .insert(i64::MIN..i64::MIN + 1, "low")
+        .insert(-5..5, "mid")
+        .insert(i64::MAX - 1..i64::MAX, "high")
+        .build();
+
+    assert_eq!(tree.query(i64::MIN..i64::MIN + 1).count(), 1);
+    assert_eq!(tree.query(i64::MAX - 1..i64::MAX).count(), 1);
+    assert_eq!(tree.query(i64::MIN..i64::MAX).count(), 3);
+    assert_eq!(tree.count_overlaps(i64::MIN..i64::MAX), 3);
+    assert_eq!(tree.count_overlaps(i64::MIN + 1..i64::MAX - 1), 1);
 }

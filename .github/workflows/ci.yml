@@ -38,6 +38,22 @@ jobs:
       - run: rustup update stable && rustup default stable
       - run: cargo test --features avx512
 
+  # Execute the AVX-512 kernels for real under Intel SDE emulation
+  # (Sapphire Rapids profile). GitHub runners rarely expose AVX-512, so this
+  # is the only place the 512-bit instructions actually run. Lib tests only:
+  # they cover the kernel unit tests and the randomized hybrid-scan
+  # cross-check, and emulation is too slow for the proptest suites.
+  avx512-sde:
+    name: avx512 kernels under Intel SDE
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - uses: petarpetrovt/setup-sde@v5.0
+      - run: cargo test --lib --features avx512
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ env.SDE_PATH }}/sde64 -spr --
+
   # Prove the no_std claim against a target with no std at all.
   no-std:
     name: no_std (thumbv7em)
