@@ -74,11 +74,27 @@ if let Some(filename) = sstables.get(id2) {
 
 ## Performance
 
-Run `cargo bench` for numbers on your hardware. The `query` benchmark group
-compares against `intervaltree`, `rust-lapper`, `coitrees`, and
-`superintervals`. Note the two simd-intervaltree entries: the count-only path
-(`count_overlaps`, comparable to coitrees' `query_count`) and the iterator
-path (comparable to crates that must enumerate results).
+Query benchmarks on a Ryzen 9 5900X (Zen 3, AVX2, Rust 1.86, Windows/MSVC,
+system allocator). Uniform random intervals (~5K wide over a 0..1M domain),
+~500-wide queries; matches per query grow from ~6 at 1K to ~10K at 1M.
+Time is per query, lower is better:
+
+| Size | simd (count) | coitrees (count) | simd (iter) | superintervals | rust-lapper | intervaltree |
+|------|-------------|------------------|-------------|----------------|-------------|--------------|
+| 1K   | 48 ns       | **28 ns**        | 68 ns       | **13 ns**      | 18 ns       | 100 ns       |
+| 10K  | **100 ns**  | 107 ns           | 231 ns      | **172 ns**     | 243 ns      | 604 ns       |
+| 100K | **239 ns**  | 644 ns           | **1.50 µs** | 1.63 µs        | 2.00 µs     | 5.52 µs      |
+| 1M   | **463 ns**  | 6.62 µs          | **13.9 µs** | 16.6 µs        | 18.5 µs     | 52.6 µs      |
+
+The two comparisons to read: count-vs-count (`count_overlaps` vs coitrees'
+`query_count`) and enumerate-vs-enumerate (the iterator path vs crates that
+must yield each result). `count_overlaps` is sub-linear in the number of
+matches — hybrid cutoff searches reduce each node's contribution to index
+arithmetic — so its advantage compounds with scale (2.7× at 100K, 14× at 1M).
+Below ~10K intervals, flat sorted-array structures like superintervals have
+lower fixed overhead and win.
+
+Run `cargo bench` for numbers on your hardware.
 
 ## Architecture
 

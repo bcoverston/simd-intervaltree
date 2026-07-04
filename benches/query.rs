@@ -122,7 +122,7 @@ fn bench_construction(c: &mut Criterion) {
 fn bench_query(c: &mut Criterion) {
     let mut group = c.benchmark_group("query");
 
-    for size in [1_000, 10_000, 100_000] {
+    for size in [1_000, 10_000, 100_000, 1_000_000] {
         let intervals = generate_intervals(size, 42);
         let queries = generate_queries(1000, 123);
 
