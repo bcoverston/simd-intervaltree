@@ -111,7 +111,7 @@ impl<T: Ord + Copy, V> IntervalTreeBuilder<T, V> {
 
         // Phase 1: Sort by start once - O(n log n)
         self.intervals
-            .sort_unstable_by(|(a, _), (b, _)| a.start.cmp(&b.start));
+            .sort_unstable_by_key(|(interval, _)| interval.start);
 
         // Extract into SOA format
         let mut input_starts: Vec<T> = Vec::with_capacity(n);
