@@ -99,14 +99,7 @@ impl<T: Ord + Copy, V> IntervalTreeBuilder<T, V> {
         let n = self.intervals.len();
 
         if n == 0 {
-            return IntervalTree {
-                starts: Vec::new(),
-                ends: Vec::new(),
-                values: Vec::new(),
-                nodes: Vec::new(),
-                ends_desc: Vec::new(),
-                by_end_indices: Vec::new(),
-            };
+            return IntervalTree::empty();
         }
 
         // Phase 1: Sort by start once - O(n log n)

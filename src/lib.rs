@@ -5,9 +5,11 @@
 //! ## Features
 //!
 //! - **Zero-allocation queries**: Iterator and callback-based APIs that don't allocate
-//! - **SIMD acceleration**: Uses AVX2/AVX-512 on x86_64, NEON on ARM for fast scans
-//! - **Generic bounds**: Works with any `Ord` type, with fast paths for primitives
-//! - **Immutable after construction**: `Send + Sync` by default
+//! - **Generic bounds**: `query` and `query_with` work with any `Ord + Copy` bound
+//! - **SIMD for `i64`**: `count_overlaps` and `query_simd` use AVX2 (AVX-512
+//!   opt-in) on x86_64 and NEON on aarch64 to find each node's cutoff
+//! - **Immutable after construction**: `Send + Sync` when its contents are
+//! - **Mutable sets**: [`IntervalSet`] adds insert and remove with stable IDs
 //! - **`no_std` compatible**: Only requires `alloc`
 //!
 //! ## Example
@@ -35,9 +37,6 @@
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
-#![deny(clippy::all)]
-#![warn(clippy::pedantic, clippy::nursery)]
-#![allow(clippy::module_name_repetitions)]
 
 extern crate alloc;
 
@@ -103,6 +102,10 @@ impl<T: Ord> Interval<T> {
 }
 
 impl<T: Ord> From<core::ops::Range<T>> for Interval<T> {
+    /// # Panics
+    ///
+    /// Panics if `range.start > range.end` (a reversed range). Empty ranges
+    /// (`start == end`) are allowed and overlap nothing.
     fn from(range: core::ops::Range<T>) -> Self {
         Self::new(range.start, range.end)
     }

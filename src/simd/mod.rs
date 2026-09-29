@@ -33,6 +33,55 @@ mod arm;
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 mod scalar;
 
+/// How a traversal trims a node's sorted run to its overlapping prefix.
+///
+/// Traversals stop at the first non-overlapping interval on their own, so a
+/// strategy may skip the work and return the whole length. Monomorphized per
+/// strategy so the calls inline into the traversal.
+pub(crate) trait Cutoffs<T> {
+    /// Length of the prefix of ascending `arr` below `threshold`, or any
+    /// longer length up to `arr.len()`.
+    fn first_ge(arr: &[T], threshold: T) -> usize;
+    /// Length of the prefix of descending `arr` above `threshold`, or any
+    /// longer length up to `arr.len()`.
+    fn first_le(arr: &[T], threshold: T) -> usize;
+}
+
+/// Leaves runs whole; the traversal's early exit finds the boundary.
+///
+/// Callers yield every element before the boundary anyway, so one fused
+/// compare-and-yield pass is cheapest. Computing the cutoff first measured
+/// ~15% slower on the query iterator for large trees (a second pass).
+pub(crate) struct Scalar;
+
+impl<T> Cutoffs<T> for Scalar {
+    #[inline]
+    fn first_ge(arr: &[T], _: T) -> usize {
+        arr.len()
+    }
+
+    #[inline]
+    fn first_le(arr: &[T], _: T) -> usize {
+        arr.len()
+    }
+}
+
+/// Binary narrowing plus a SIMD scan of the final window; `i64` only.
+/// Exact, so a trimmed run's length is its overlap count.
+pub(crate) struct Simd;
+
+impl Cutoffs<i64> for Simd {
+    #[inline]
+    fn first_ge(arr: &[i64], threshold: i64) -> usize {
+        find_ge_threshold_i64(arr, threshold)
+    }
+
+    #[inline]
+    fn first_le(arr: &[i64], threshold: i64) -> usize {
+        find_le_threshold_i64(arr, threshold)
+    }
+}
+
 /// Window size at or below which we scan linearly (with SIMD where available)
 /// instead of binary-searching. Chosen to cover a few cache lines of i64s.
 const LINEAR_SCAN_MAX: usize = 64;

@@ -1,7 +1,7 @@
 //! Property-based tests for interval tree correctness.
 
 use proptest::prelude::*;
-use simd_intervaltree::{IntervalSet, IntervalTree};
+use simd_intervaltree::{IntervalId, IntervalSet, IntervalTree};
 use std::collections::HashSet;
 
 /// Generate a valid interval (start < end)
@@ -395,6 +395,75 @@ fn empty_query_returns_nothing_on_all_paths() {
         ControlFlow::<()>::Continue(())
     });
     assert_eq!(simd_hits, 0);
+}
+
+/// One step of an `IntervalSet` workload.
+#[derive(Debug, Clone)]
+enum SetOp {
+    Insert(i64, i64),
+    /// Remove the live interval at this index (mod the live count).
+    Remove(usize),
+    Query(i64, i64),
+}
+
+fn set_op() -> impl Strategy<Value = SetOp> {
+    prop_oneof![
+        3 => (0i64..10_000, 0i64..500).prop_map(|(s, len)| SetOp::Insert(s, s + len)),
+        2 => any::<usize>().prop_map(SetOp::Remove),
+        2 => (0i64..10_000, 1i64..2_000).prop_map(|(s, len)| SetOp::Query(s, s + len)),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Interleaved inserts, removes, and queries agree with a flat model.
+    /// Long sequences force several rebuilds and heavy slot reuse, which is
+    /// where a stale tree entry could surface as its slot's new occupant.
+    #[test]
+    fn set_interleaved_ops_match_model(ops in prop::collection::vec(set_op(), 1..600)) {
+        let mut set = IntervalSet::new();
+        let mut live: Vec<(IntervalId, i64, i64)> = Vec::new();
+        let mut removed: Vec<IntervalId> = Vec::new();
+
+        for op in ops {
+            match op {
+                SetOp::Insert(s, e) => {
+                    let id = set.insert(s..e, (s, e));
+                    live.push((id, s, e));
+                }
+                SetOp::Remove(k) => {
+                    if live.is_empty() {
+                        continue;
+                    }
+                    let (id, _, _) = live.swap_remove(k % live.len());
+                    prop_assert!(set.remove(id));
+                    prop_assert!(!set.remove(id));
+                    removed.push(id);
+                }
+                SetOp::Query(s, e) => {
+                    let mut got = Vec::new();
+                    for (id, interval, value) in set.query(s..e) {
+                        prop_assert_eq!((interval.start, interval.end), *value);
+                        got.push(id.as_u64());
+                    }
+                    let mut want: Vec<u64> = live
+                        .iter()
+                        .filter(|(_, a, b)| a < b && *a < e && s < *b)
+                        .map(|(id, _, _)| id.as_u64())
+                        .collect();
+                    got.sort_unstable();
+                    want.sort_unstable();
+                    prop_assert_eq!(got, want);
+                }
+            }
+        }
+
+        prop_assert_eq!(set.len(), live.len());
+        for id in removed {
+            prop_assert!(set.get(id).is_none());
+        }
+    }
 }
 
 /// IntervalSet with zero-width intervals: IDs stay valid, queries skip them.
