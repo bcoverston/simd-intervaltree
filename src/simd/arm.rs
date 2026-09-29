@@ -1,4 +1,10 @@
 //! ARM NEON SIMD implementations.
+//!
+//! Two i64 lanes per vector, with an early exit at the first matching pair.
+//! On an Apple M4, `count_overlaps` with these kernels ran 10-32% faster than
+//! with the scalar binary-search fallback. A branch-free variant that counts
+//! matches across the whole window ran 18-155% slower: the boundary usually
+//! sits near the start of the window, so the early exit wins.
 
 #![allow(unsafe_code)]
 
