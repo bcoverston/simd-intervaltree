@@ -4,10 +4,10 @@ A SIMD-accelerated interval tree with zero-allocation queries.
 
 ## Features
 
-- **SIMD acceleration**: AVX2 and NEON kernels with runtime dispatch; AVX-512 opt-in
+- **SIMD for `i64`**: AVX2 and NEON kernels with runtime dispatch (AVX-512 opt-in) behind `count_overlaps` and `query_simd`; `query` and `query_with` work for any `Ord + Copy` bound
 - **Hybrid scans**: large sorted runs are binary-narrowed, only the final window is SIMD-scanned
 - **Zero-allocation queries**: Iterator-based API with stack-based traversal
-- **Mutable collections**: `IntervalSet` with stable IDs for insert/remove
+- **Mutable collections**: `IntervalSet` with stable IDs; inserts and removes are buffered and folded into the tree in amortized batches
 - **`no_std` compatible**: Only requires `alloc`
 - **Zero dependencies**
 
@@ -72,6 +72,12 @@ if let Some(filename) = sstables.get(id2) {
 }
 ```
 
+`IntervalSet` keeps an `IntervalTree` of the intervals present at its last
+rebuild, plus a list of later inserts that queries scan linearly; removed
+intervals are filtered out. Once pending inserts and removes exceed
+max(64, √n), the next mutation rebuilds in O(n log n). Queries take `&self`
+and never rebuild.
+
 ## Performance
 
 Query benchmarks on a Ryzen 9 5900X (Zen 3, AVX2, Rust 1.86, Windows/MSVC,
@@ -79,7 +85,7 @@ system allocator). Uniform random intervals (~5K wide over a 0..1M domain),
 ~500-wide queries; matches per query grow from ~6 at 1K to ~10K at 1M.
 Time is per query, lower is better:
 
-| Size | simd (count) | coitrees (count) | simd (iter) | superintervals | rust-lapper | intervaltree |
+| Size | `count_overlaps` | coitrees (count) | `query` iterator | superintervals | rust-lapper | intervaltree |
 |------|-------------|------------------|-------------|----------------|-------------|--------------|
 | 1K   | 48 ns       | **28 ns**        | 68 ns       | **13 ns**      | 18 ns       | 100 ns       |
 | 10K  | **100 ns**  | 107 ns           | 231 ns      | **172 ns**     | 243 ns      | 604 ns       |
@@ -87,14 +93,18 @@ Time is per query, lower is better:
 | 1M   | **463 ns**  | 6.62 µs          | **13.9 µs** | 16.6 µs        | 18.5 µs     | 52.6 µs      |
 
 The two comparisons to read: count-vs-count (`count_overlaps` vs coitrees'
-`query_count`) and enumerate-vs-enumerate (the iterator path vs crates that
-must yield each result). `count_overlaps` is sub-linear in the number of
+`query_count`) and enumerate-vs-enumerate (the `query` iterator vs crates that
+must yield each result). The iterator is the generic path and uses no SIMD;
+its lead at scale comes from the layout, where each node keeps an end-sorted
+copy so scans stop at the first miss. `count_overlaps` is sub-linear in the number of
 matches — hybrid cutoff searches reduce each node's contribution to index
 arithmetic — so its advantage compounds with scale (2.7× at 100K, 14× at 1M).
 Below ~10K intervals, flat sorted-array structures like superintervals have
 lower fixed overhead and win.
 
-Run `cargo bench` for numbers on your hardware.
+These numbers predate 0.2.0's traversal refactor. On an Apple M4 the
+refactor moved both columns within ±5% of the previous code. Run
+`cargo bench` for numbers on your hardware.
 
 ## Architecture
 
