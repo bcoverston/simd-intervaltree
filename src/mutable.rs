@@ -12,16 +12,30 @@ use crate::Interval;
 
 /// A stable identifier for an interval in the collection.
 ///
-/// These identifiers remain valid across insertions and removals,
-/// making them suitable for mapping to external resources.
+/// An ID packs a slot index and a 32-bit generation. Slots are reused after
+/// removal; the generation tells a stale ID from the slot's new occupant.
+/// The generation counter wraps after 2³² insertions, so an ID held across
+/// that many insertions could match a later interval in the same slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IntervalId(u64);
 
 impl IntervalId {
+    const fn new(slot: usize, generation: u32) -> Self {
+        Self(((generation as u64) << 32) | slot as u64)
+    }
+
+    const fn slot(self) -> usize {
+        (self.0 & 0xFFFF_FFFF) as usize
+    }
+
+    const fn generation(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
     /// Returns the raw identifier value.
     #[inline]
     #[must_use]
-    pub fn as_u64(self) -> u64 {
+    pub const fn as_u64(self) -> u64 {
         self.0
     }
 }
@@ -34,14 +48,26 @@ struct Entry<T, V> {
     generation: u32,
 }
 
+/// Rebuild once this many pending inserts and removals have accumulated.
+///
+/// Queries scan the pending inserts linearly, and each rebuild costs
+/// O(n log n), so √n balances the two; the floor keeps small sets from
+/// rebuilding constantly.
+fn rebuild_threshold(tree_len: usize) -> usize {
+    tree_len.isqrt().max(64)
+}
+
 /// A mutable interval collection with stable identifiers.
 ///
 /// Unlike [`IntervalTree`], this collection supports dynamic insertion
 /// and removal. Each inserted interval receives a stable [`IntervalId`]
 /// that remains valid until the interval is removed.
 ///
-/// Internally maintains a pending buffer that gets merged into an
-/// optimized tree structure on query.
+/// Internally it keeps an [`IntervalTree`] of the intervals present at the
+/// last rebuild, plus a pending list of later insertions that queries scan
+/// linearly. Removed intervals stay in the tree and are filtered out. Once
+/// pending insertions and removals together exceed max(64, √n), the next
+/// insert or remove rebuilds the tree in O(n log n); queries never rebuild.
 ///
 /// # Example
 ///
@@ -72,8 +98,15 @@ pub struct IntervalSet<T, V> {
     next_generation: u32,
     /// Count of active intervals.
     count: usize,
-    /// Cached tree storing slot indices (invalidated on mutation).
-    cached_tree: Option<IntervalTree<T, usize>>,
+    /// Intervals present at the last rebuild. Values are full IDs rather
+    /// than slots, so a slot reused since then is not mistaken for its old
+    /// occupant.
+    tree: IntervalTree<T, IntervalId>,
+    /// Insertions since the last rebuild.
+    pending: Vec<IntervalId>,
+    /// Removals since the last rebuild; their IDs linger in `tree` or
+    /// `pending` until then.
+    removed_since_rebuild: usize,
 }
 
 impl<T, V> Default for IntervalSet<T, V> {
@@ -86,13 +119,7 @@ impl<T, V> IntervalSet<T, V> {
     /// Creates a new empty interval set.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            free_slots: Vec::new(),
-            next_generation: 0,
-            count: 0,
-            cached_tree: None,
-        }
+        Self::with_capacity(0)
     }
 
     /// Creates a new interval set with the specified capacity.
@@ -103,7 +130,9 @@ impl<T, V> IntervalSet<T, V> {
             free_slots: Vec::new(),
             next_generation: 0,
             count: 0,
-            cached_tree: None,
+            tree: IntervalTree::empty(),
+            pending: Vec::new(),
+            removed_since_rebuild: 0,
         }
     }
 
@@ -122,11 +151,43 @@ impl<T, V> IntervalSet<T, V> {
     }
 
     /// Clears all intervals from the set.
+    ///
+    /// The generation counter keeps running, so IDs issued before the clear
+    /// stay invalid.
     pub fn clear(&mut self) {
         self.entries.clear();
         self.free_slots.clear();
         self.count = 0;
-        self.cached_tree = None;
+        self.tree = IntervalTree::empty();
+        self.pending.clear();
+        self.removed_since_rebuild = 0;
+    }
+
+    /// The live entry for `id`, or `None` if it was removed.
+    fn entry(&self, id: IntervalId) -> Option<&Entry<T, V>> {
+        self.entries
+            .get(id.slot())?
+            .as_ref()
+            .filter(|entry| entry.generation == id.generation())
+    }
+
+    /// Returns the value associated with an interval ID, if it exists.
+    #[must_use]
+    pub fn get(&self, id: IntervalId) -> Option<&V> {
+        self.entry(id).map(|entry| &entry.value)
+    }
+
+    /// Returns an iterator over all intervals and their IDs.
+    pub fn iter(&self) -> impl Iterator<Item = (IntervalId, Interval<T>, &V)>
+    where
+        T: Copy,
+    {
+        self.entries.iter().enumerate().filter_map(|(slot, entry)| {
+            entry.as_ref().map(|e| {
+                let id = IntervalId::new(slot, e.generation);
+                (id, e.interval, &e.value)
+            })
+        })
     }
 }
 
@@ -136,12 +197,11 @@ impl<T: Ord + Copy, V> IntervalSet<T, V> {
     /// Returns a stable [`IntervalId`] that can be used for removal
     /// or mapping to external resources.
     pub fn insert<R: Into<Interval<T>>>(&mut self, range: R, value: V) -> IntervalId {
-        let interval = range.into();
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
 
         let entry = Entry {
-            interval,
+            interval: range.into(),
             value,
             generation,
         };
@@ -150,118 +210,73 @@ impl<T: Ord + Copy, V> IntervalSet<T, V> {
             self.entries[slot] = Some(entry);
             slot
         } else {
-            let slot = self.entries.len();
             self.entries.push(Some(entry));
-            slot
+            self.entries.len() - 1
         };
-
         self.count += 1;
-        self.cached_tree = None; // Invalidate cache
 
-        // Encode slot and generation into ID
-        IntervalId(((generation as u64) << 32) | (slot as u64))
+        let id = IntervalId::new(slot, generation);
+        self.pending.push(id);
+        self.rebuild_if_due();
+        id
     }
 
     /// Removes an interval by its ID.
     ///
     /// Returns `true` if the interval was found and removed.
     pub fn remove(&mut self, id: IntervalId) -> bool {
-        let slot = (id.0 & 0xFFFF_FFFF) as usize;
-        let generation = (id.0 >> 32) as u32;
-
-        if slot >= self.entries.len() {
+        if self.entry(id).is_none() {
             return false;
         }
-
-        if let Some(entry) = &self.entries[slot] {
-            if entry.generation == generation {
-                self.entries[slot] = None;
-                self.free_slots.push(slot);
-                self.count -= 1;
-                self.cached_tree = None; // Invalidate cache
-                return true;
-            }
-        }
-
-        false
-    }
-
-    /// Returns the value associated with an interval ID, if it exists.
-    #[must_use]
-    pub fn get(&self, id: IntervalId) -> Option<&V> {
-        let slot = (id.0 & 0xFFFF_FFFF) as usize;
-        let generation = (id.0 >> 32) as u32;
-
-        self.entries.get(slot).and_then(|e| {
-            e.as_ref()
-                .filter(|entry| entry.generation == generation)
-                .map(|entry| &entry.value)
-        })
+        self.entries[id.slot()] = None;
+        self.free_slots.push(id.slot());
+        self.count -= 1;
+        self.removed_since_rebuild += 1;
+        self.rebuild_if_due();
+        true
     }
 
     /// Returns the interval associated with an ID, if it exists.
     #[must_use]
     pub fn get_interval(&self, id: IntervalId) -> Option<Interval<T>> {
-        let slot = (id.0 & 0xFFFF_FFFF) as usize;
-        let generation = (id.0 >> 32) as u32;
-
-        self.entries.get(slot).and_then(|e| {
-            e.as_ref()
-                .filter(|entry| entry.generation == generation)
-                .map(|entry| entry.interval)
-        })
-    }
-
-    /// Rebuilds the internal tree if needed.
-    fn ensure_tree(&mut self) {
-        if self.cached_tree.is_some() {
-            return;
-        }
-
-        let mut builder = IntervalTreeBuilder::with_capacity(self.count);
-
-        for (slot, entry) in self.entries.iter().enumerate() {
-            if let Some(e) = entry {
-                builder = builder.insert(e.interval, slot);
-            }
-        }
-
-        self.cached_tree = Some(builder.build());
+        self.entry(id).map(|entry| entry.interval)
     }
 
     /// Queries for all intervals overlapping the given range.
     ///
     /// Returns an iterator yielding `(IntervalId, Interval<T>, &V)` tuples.
-    /// This may trigger an internal rebuild if the collection has been modified.
+    /// Intervals inserted since the last internal rebuild come after those
+    /// from the tree.
     pub fn query<R: Into<Interval<T>>>(
-        &mut self,
+        &self,
         range: R,
     ) -> impl Iterator<Item = (IntervalId, Interval<T>, &V)> {
-        self.ensure_tree();
-        let entries = &self.entries;
-        self.cached_tree
-            .as_ref()
-            .unwrap()
-            .query(range)
-            .filter_map(move |entry| {
-                let slot = *entry.value;
-                entries.get(slot).and_then(|e| {
-                    e.as_ref().map(|ent| {
-                        let id = IntervalId(((ent.generation as u64) << 32) | (slot as u64));
-                        (id, ent.interval, &ent.value)
-                    })
-                })
-            })
+        let query = range.into();
+        let from_tree = self.tree.query(query).map(|hit| *hit.value);
+        let from_pending = self.pending.iter().copied().filter(move |&id| {
+            self.entry(id)
+                .is_some_and(|entry| entry.interval.overlaps(&query))
+        });
+        from_tree
+            .chain(from_pending)
+            .filter_map(move |id| self.entry(id).map(|e| (id, e.interval, &e.value)))
     }
 
-    /// Returns an iterator over all intervals and their IDs.
-    pub fn iter(&self) -> impl Iterator<Item = (IntervalId, Interval<T>, &V)> {
-        self.entries.iter().enumerate().filter_map(|(slot, entry)| {
-            entry.as_ref().map(|e| {
-                let id = IntervalId(((e.generation as u64) << 32) | (slot as u64));
-                (id, e.interval, &e.value)
-            })
-        })
+    fn rebuild_if_due(&mut self) {
+        let churn = self.pending.len() + self.removed_since_rebuild;
+        if churn <= rebuild_threshold(self.tree.len()) {
+            return;
+        }
+
+        let mut builder = IntervalTreeBuilder::with_capacity(self.count);
+        for (slot, entry) in self.entries.iter().enumerate() {
+            if let Some(e) = entry {
+                builder = builder.insert(e.interval, IntervalId::new(slot, e.generation));
+            }
+        }
+        self.tree = builder.build();
+        self.pending.clear();
+        self.removed_since_rebuild = 0;
     }
 }
 
