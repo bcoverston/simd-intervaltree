@@ -1,0 +1,51 @@
+name: Release
+
+# Publishes to crates.io when a version tag (v1.2.3) is pushed. Auth is
+# crates.io Trusted Publishing: this repo, this file, and the `release`
+# environment are registered on the crate, so no API token is stored here.
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-latest
+    # Must match the environment registered on crates.io. Its required
+    # reviewers approve each publish before this job starts.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # OIDC token for crates.io Trusted Publishing
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history, for the on-main check
+
+      - name: Tag matches Cargo.toml version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - name: Tagged commit is on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag $GITHUB_REF_NAME points at a commit that is not on main"
+            exit 1
+          fi
+
+      - run: cargo publish --dry-run
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

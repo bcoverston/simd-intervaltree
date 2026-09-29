@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml runs the full matrix against the tagged commit before publishing.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
